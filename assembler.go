@@ -232,7 +232,8 @@ type stream struct {
 	closedByFIN   bool
 	pending       []segment
 	chunks        map[int64][]byte
-	gaps          []Gap
+	observations  []Fragment
+	incomplete    []ByteRange
 	evidenceCount map[EvidenceKind]int
 	maxOffset     int64
 	received      int
@@ -276,19 +277,30 @@ func (s *stream) ingest(p RawPacket, direction Direction, sess *Session) error {
 		relStart = 0
 	}
 	if seqBefore(end, s.next) || end == s.next {
+		s.observations = append(s.observations, Fragment{Packet: p.Index, Seq: start, Offset: relStart, Data: append([]byte(nil), data...)})
 		s.evidenceOverlap(sess, p, direction, data, relStart, false)
 		return nil
 	}
 	if seqBefore(start, s.next) {
-		cut := int(rel32(s.next, start))
+		cut := int(rel32(start, s.next))
 		overlapData := data
+		overlapSeq := start
+		overlapOffset := int64(rel32(s.isn+1, start))
 		start = s.next
 		data = data[cut:]
 		relStart = int64(rel32(s.isn+1, start))
-		s.evidenceOverlap(sess, p, direction, overlapData, relStart, true)
 		if len(data) == 0 {
+			s.observations = append(s.observations, Fragment{Packet: p.Index, Seq: overlapSeq, Offset: overlapOffset, Data: append([]byte(nil), overlapData...)})
+			s.evidenceOverlap(sess, p, direction, overlapData, relStart, true)
 			return nil
 		}
+		if s.a.limits.MaxStreamBytes > 0 && int64(s.received+len(data)) > s.a.limits.MaxStreamBytes {
+			atomic.AddInt64(&s.a.stats.BudgetStops, 1)
+			s.incomplete = appendRange(s.incomplete, relStart, len(data))
+			return ErrStreamBudgetExhausted
+		}
+		s.observations = append(s.observations, Fragment{Packet: p.Index, Seq: overlapSeq, Offset: overlapOffset, Data: append([]byte(nil), overlapData...)})
+		s.evidenceOverlap(sess, p, direction, overlapData, relStart, true)
 		if start != s.next {
 			return nil
 		}
@@ -303,21 +315,29 @@ func (s *stream) ingest(p RawPacket, direction Direction, sess *Session) error {
 			gap := Gap{Direction: direction, StartSeq: s.next, Length: int(suspension), Offset: int64(rel32(s.isn+1, s.next))}
 			sess.addEvidence(Evidence{Kind: EvidenceGap, Packet: p.Index, Direction: direction, Sequence: s.next, Length: gap.Length, Offset: gap.Offset, Detail: fmt.Sprintf("missing %d bytes before sequence %d", gap.Length, start)})
 		}
-		if idx := s.findPending(start); idx >= 0 {
-			existing := s.pending[idx].data
+		if idx := s.findPendingOverlap(start, end); idx >= 0 {
+			existing := s.pending[idx]
+			overlapStart := maxRel(relStart, existing.offset)
+			overlapEnd := minRel(relStart+int64(len(data)), existing.offset+int64(len(existing.data)))
+			overlapLength := int(overlapEnd - overlapStart)
+			newPart := data[overlapStart-relStart:]
+			existingPart := existing.data[overlapStart-existing.offset:]
 			detail := "duplicate out-of-order segment"
 			kind := EvidenceRetransmission
-			if len(existing) != len(data) || !bytesEqual(existing, data) {
-				detail = "conflicting out-of-order overlap; first observed bytes retained"
+			if !bytesEqual(existingPart[:overlapLength], newPart[:overlapLength]) {
+				detail = "conflicting out-of-order overlap; all observed bytes retained as candidates"
 				kind = EvidenceOverlapConflict
 			}
 			sess.addEvidence(Evidence{Kind: kind, Packet: p.Index, Direction: direction, Sequence: start, Length: len(data), Offset: relStart, Detail: detail})
+			s.observations = append(s.observations, Fragment{Packet: p.Index, Seq: start, Offset: relStart, Data: append([]byte(nil), data...)})
 			return nil
 		}
 		if s.a.limits.MaxPendingBytes > 0 && atomic.LoadInt64(&s.a.stats.PendingBytes)+int64(len(data)) > s.a.limits.MaxPendingBytes {
 			atomic.AddInt64(&s.a.stats.BudgetStops, 1)
+			s.incomplete = appendRange(s.incomplete, relStart, len(data))
 			return ErrPendingBudgetExhausted
 		}
+		s.observations = append(s.observations, Fragment{Packet: p.Index, Seq: start, Offset: relStart, Data: append([]byte(nil), data...)})
 		s.pending = append(s.pending, segment{seq: start, data: append([]byte(nil), data...), packet: p.Index, offset: relStart})
 		s.a.pendingDelta(int64(len(data)))
 		sess.addEvidence(Evidence{Kind: EvidenceOutOfOrder, Packet: p.Index, Direction: direction, Sequence: start, Length: len(data), Offset: relStart})
@@ -326,6 +346,12 @@ func (s *stream) ingest(p RawPacket, direction Direction, sess *Session) error {
 		}
 		return nil
 	}
+	if s.a.limits.MaxStreamBytes > 0 && int64(s.received+len(data)) > s.a.limits.MaxStreamBytes {
+		atomic.AddInt64(&s.a.stats.BudgetStops, 1)
+		s.incomplete = appendRange(s.incomplete, relStart, len(data))
+		return ErrStreamBudgetExhausted
+	}
+	s.observations = append(s.observations, Fragment{Packet: p.Index, Seq: start, Offset: relStart, Data: append([]byte(nil), data...)})
 	if err := s.acceptInOrder(sess, p, direction, start, data, relStart); err != nil {
 		return err
 	}
@@ -349,15 +375,29 @@ func (s *stream) acceptInOrder(sess *Session, p RawPacket, direction Direction, 
 
 func (s *stream) drainPending(sess *Session, direction Direction) error {
 	for {
-		idx := s.findPending(s.next)
+		idx := s.findPendingStartingAtOrBefore(s.next)
 		if idx < 0 {
 			return nil
 		}
 		seg := s.pending[idx]
+		cut := 0
+		if seqBefore(seg.seq, s.next) {
+			cut = int(rel32(seg.seq, s.next))
+			prefix := seg.data[:cut]
+			s.evidenceOverlap(sess, RawPacket{Index: seg.packet, Seq: seg.seq, Payload: prefix}, direction, prefix, seg.offset, cut < len(seg.data))
+			seg.seq = s.next
+			seg.offset = int64(rel32(s.isn+1, s.next))
+			seg.data = seg.data[cut:]
+			s.pending[idx] = seg
+		}
+		if len(seg.data) == 0 {
+			s.pending = append(s.pending[:idx], s.pending[idx+1:]...)
+			s.a.pendingDelta(-int64(cut))
+			continue
+		}
 		s.pending = append(s.pending[:idx], s.pending[idx+1:]...)
-		s.a.pendingDelta(-int64(len(seg.data)))
-		relStart := int64(rel32(s.isn+1, seg.seq))
-		if err := s.acceptInOrder(sess, RawPacket{Index: seg.packet, Seq: seg.seq}, direction, seg.seq, seg.data, relStart); err != nil {
+		s.a.pendingDelta(-int64(len(seg.data) + cut))
+		if err := s.acceptInOrder(sess, RawPacket{Index: seg.packet, Seq: seg.seq}, direction, seg.seq, seg.data, seg.offset); err != nil {
 			return err
 		}
 	}
@@ -366,6 +406,40 @@ func (s *stream) drainPending(sess *Session, direction Direction) error {
 func (s *stream) findPending(seq uint32) int {
 	for i, seg := range s.pending {
 		if seg.seq == seq {
+			return i
+		}
+	}
+	return -1
+}
+
+func (s *stream) findPendingOverlap(start, end uint32) int {
+	for i, seg := range s.pending {
+		segEnd := addSeq(seg.seq, uint32(len(seg.data)))
+		if start == seg.seq || (seqBefore(start, segEnd) && seqBefore(seg.seq, end)) {
+			return i
+		}
+	}
+	return -1
+}
+
+func maxRel(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minRel(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (s *stream) findPendingStartingAtOrBefore(seq uint32) int {
+	for i, seg := range s.pending {
+		end := addSeq(seg.seq, uint32(len(seg.data)))
+		if seg.seq == seq || (seqBefore(seg.seq, seq) && seqBefore(seq, end)) {
 			return i
 		}
 	}
@@ -446,65 +520,243 @@ func (s *stream) markFIN(p RawPacket, direction Direction, sess *Session) {
 }
 
 func (s *stream) result(direction Direction) StreamResult {
-	blocks, data := s.materialize(direction)
+	blocks, candidates, gaps, available, uncertain, incomplete := s.materialize(direction)
+	data := blocksToBytes(blocks)
+	fragments := append([]Fragment(nil), s.observations...)
+	sort.Slice(fragments, func(i, j int) bool {
+		if fragments[i].Offset != fragments[j].Offset {
+			return fragments[i].Offset < fragments[j].Offset
+		}
+		return fragments[i].Packet < fragments[j].Packet
+	})
 	return StreamResult{
-		Direction: direction,
-		ISN:       s.isn,
-		NextSeq:   s.next,
-		FINSeq:    s.finSeq,
-		Closed:    s.closedByFIN,
-		Bytes:     data,
-		Blocks:    blocks,
-		Gaps:      append([]Gap(nil), s.gaps...),
-		Received:  s.received,
+		Direction:        direction,
+		ISN:              s.isn,
+		NextSeq:          s.next,
+		FINSeq:           s.finSeq,
+		Closed:           s.closedByFIN,
+		Bytes:            data,
+		Blocks:           blocks,
+		Gaps:             gaps,
+		IncompleteRanges: incomplete,
+		UncertainRanges:  uncertain,
+		AvailableRanges:  available,
+		Fragments:        fragments,
+		Candidates:       candidates,
+		Received:         s.received,
 	}
 }
 
-func (s *stream) materialize(direction Direction) ([]Block, []byte) {
-	var offsets []int64
-	available := make(map[int64][]byte, len(s.chunks)+len(s.pending))
-	for off := range s.chunks {
-		offsets = append(offsets, off)
-		available[off] = s.chunks[off]
+func (s *stream) materialize(direction Direction) ([]Block, []StreamCandidate, []Gap, []ByteRange, []ByteRange, []ByteRange) {
+	var boundaries []int64
+	for _, frag := range s.observations {
+		boundaries = append(boundaries, frag.Offset, frag.Offset+int64(len(frag.Data)))
 	}
-	for _, seg := range s.pending {
-		if _, exists := available[seg.offset]; !exists {
-			offsets = append(offsets, seg.offset)
-			available[seg.offset] = seg.data
+	boundaries = appendDifferenceBoundaries(boundaries, s.observations)
+	observedEnd := int64(0)
+	declaredEnd := int64(-1)
+	for _, frag := range s.observations {
+		if end := frag.Offset + int64(len(frag.Data)); end > observedEnd {
+			observedEnd = end
 		}
 	}
-	sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
-	coverageEnd := int64(0)
-	var blocks []Block
-	var data []byte
-	for _, off := range offsets {
-		chunk := available[off]
-		if off < coverageEnd {
-			skip := int(coverageEnd - off)
-			if skip >= len(chunk) {
-				continue
-			}
-			chunk = chunk[skip:]
-			off = coverageEnd
+	for _, extra := range s.incomplete {
+		boundaries = append(boundaries, extra.Offset, extra.Offset+int64(extra.Length))
+		if end := extra.Offset + int64(extra.Length); end > observedEnd {
+			observedEnd = end
 		}
-		if off > coverageEnd {
-			length := int(off - coverageEnd)
-			blocks = append(blocks, Block{Kind: BlockGap, Length: length})
-			addGapResult(&s.gaps, Gap{Direction: direction, StartSeq: addSeq(s.isn+1, uint32(coverageEnd)), Length: length, Offset: coverageEnd})
-		}
-		blocks = append(blocks, Block{Kind: BlockData, Data: append([]byte(nil), chunk...), Length: len(chunk)})
-		data = append(data, chunk...)
-		coverageEnd = off + int64(len(chunk))
 	}
 	if s.closedByFIN {
 		finOffset := int64(rel32(s.isn+1, s.finSeq))
-		if finOffset > coverageEnd {
-			length := int(finOffset - coverageEnd)
-			blocks = append(blocks, Block{Kind: BlockGap, Length: length})
-			addGapResult(&s.gaps, Gap{Direction: direction, StartSeq: addSeq(s.isn+1, uint32(coverageEnd)), Length: length, Offset: coverageEnd})
+		declaredEnd = finOffset
+		boundaries = append(boundaries, finOffset)
+	}
+	boundaries = append(boundaries, 0)
+	boundaries = uniqueSortedOffsets(boundaries)
+
+	var primary []Block
+	var firstBlocks, lastBlocks []Block
+	var gaps []Gap
+	var covered []ByteRange
+	var uncertain []ByteRange
+	for i := 0; i+1 < len(boundaries); i++ {
+		start, end := boundaries[i], boundaries[i+1]
+		length := int(end - start)
+		if length <= 0 || start < 0 || end > observedEnd {
+			continue
+		}
+		active := fragmentsAt(s.observations, start, end)
+		if len(active) == 0 && (end <= observedEnd || (declaredEnd >= 0 && end <= declaredEnd)) {
+			block := Block{Kind: BlockGap, Offset: start, Length: length}
+			primary = append(primary, block)
+			firstBlocks = append(firstBlocks, block)
+			lastBlocks = append(lastBlocks, block)
+			gaps = append(gaps, Gap{Direction: direction, StartSeq: addSeq(s.isn+1, uint32(start)), Length: length, Offset: start})
+			uncertain = appendRange(uncertain, start, length)
+			continue
+		}
+		first, last := active[0], active[0]
+		for _, frag := range active[1:] {
+			if frag.Packet < first.Packet {
+				first = frag
+			}
+			if frag.Packet > last.Packet {
+				last = frag
+			}
+		}
+		firstBytes := fragmentBytes(first, start, length)
+		lastBytes := fragmentBytes(last, start, length)
+		firstBlocks = append(firstBlocks, Block{Kind: BlockData, Offset: start, Data: firstBytes, Length: length})
+		lastBlocks = append(lastBlocks, Block{Kind: BlockData, Offset: start, Data: lastBytes, Length: length})
+		covered = appendRange(covered, start, length)
+		if bytesEqual(firstBytes, lastBytes) && allSame(active, start, length, firstBytes) {
+			primary = append(primary, Block{Kind: BlockData, Offset: start, Data: append([]byte(nil), firstBytes...), Length: length, Sources: append([]Fragment(nil), active...)})
+		} else {
+			values := distinctValues(active, start, length)
+			primary = append(primary, Block{Kind: BlockConflict, Offset: start, Data: append([]byte(nil), firstBytes...), Length: length, Alternatives: values, Sources: append([]Fragment(nil), active...)})
+			uncertain = appendRange(uncertain, start, length)
 		}
 	}
-	return blocks, data
+	candidates := []StreamCandidate{
+		{Rule: CandidateFirstObserved, Bytes: blocksToBytes(firstBlocks), Blocks: firstBlocks},
+		{Rule: CandidateLastObserved, Bytes: blocksToBytes(lastBlocks), Blocks: lastBlocks},
+	}
+	incomplete := append(append([]ByteRange(nil), gapsToRanges(gaps)...), s.incomplete...)
+	return primary, candidates, gaps, mergeRanges(covered), mergeRanges(uncertain), mergeRanges(incomplete)
+}
+
+func uniqueSortedOffsets(values []int64) []int64 {
+	sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
+	out := values[:0]
+	for _, value := range values {
+		if len(out) == 0 || out[len(out)-1] != value {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func appendDifferenceBoundaries(boundaries []int64, fragments []Fragment) []int64 {
+	for i := 0; i < len(fragments); i++ {
+		for j := i + 1; j < len(fragments); j++ {
+			left, right := fragments[i], fragments[j]
+			start := maxInt64(left.Offset, right.Offset)
+			end := minInt64(left.Offset+int64(len(left.Data)), right.Offset+int64(len(right.Data)))
+			different := false
+			for pos := start; pos < end; pos++ {
+				valueDifferent := left.Data[pos-left.Offset] != right.Data[pos-right.Offset]
+				if valueDifferent != different {
+					boundaries = append(boundaries, pos)
+					if different {
+						boundaries = append(boundaries, pos)
+					}
+					different = valueDifferent
+				}
+			}
+			if different {
+				boundaries = append(boundaries, end)
+			}
+		}
+	}
+	return boundaries
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func fragmentsAt(fragments []Fragment, start, end int64) []Fragment {
+	var out []Fragment
+	for _, frag := range fragments {
+		if frag.Offset <= start && frag.Offset+int64(len(frag.Data)) >= end {
+			out = append(out, frag)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Packet < out[j].Packet })
+	return out
+}
+
+func fragmentBytes(frag Fragment, start int64, length int) []byte {
+	begin := int(start - frag.Offset)
+	return append([]byte(nil), frag.Data[begin:begin+length]...)
+}
+
+func allSame(fragments []Fragment, start int64, length int, want []byte) bool {
+	for _, frag := range fragments {
+		if !bytesEqual(fragmentBytes(frag, start, length), want) {
+			return false
+		}
+	}
+	return true
+}
+
+func distinctValues(fragments []Fragment, start int64, length int) [][]byte {
+	var values [][]byte
+	for _, frag := range fragments {
+		value := fragmentBytes(frag, start, length)
+		found := false
+		for _, existing := range values {
+			if bytesEqual(existing, value) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			values = append(values, value)
+		}
+	}
+	return values
+}
+
+func appendRange(ranges []ByteRange, start int64, length int) []ByteRange {
+	return mergeRanges(append(ranges, ByteRange{Offset: start, Length: length}))
+}
+
+func mergeRanges(ranges []ByteRange) []ByteRange {
+	if len(ranges) < 2 {
+		return ranges
+	}
+	sort.Slice(ranges, func(i, j int) bool { return ranges[i].Offset < ranges[j].Offset })
+	out := []ByteRange{ranges[0]}
+	for _, current := range ranges[1:] {
+		last := &out[len(out)-1]
+		if current.Offset <= last.Offset+int64(last.Length) {
+			if end := current.Offset + int64(current.Length); end > last.Offset+int64(last.Length) {
+				last.Length = int(end - last.Offset)
+			}
+			continue
+		}
+		out = append(out, current)
+	}
+	return out
+}
+
+func gapsToRanges(gaps []Gap) []ByteRange {
+	var ranges []ByteRange
+	for _, gap := range gaps {
+		ranges = append(ranges, ByteRange{Offset: gap.Offset, Length: gap.Length})
+	}
+	return mergeRanges(ranges)
+}
+
+func blocksToBytes(blocks []Block) []byte {
+	var data []byte
+	for _, block := range blocks {
+		if block.Kind != BlockGap {
+			data = append(data, block.Data...)
+		}
+	}
+	return data
 }
 
 func addSeq(a, b uint32) uint32 { return a + b }

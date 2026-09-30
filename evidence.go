@@ -115,33 +115,126 @@ type Gap struct {
 	Offset    int64
 }
 
+type ByteRange struct {
+	Offset int64 `json:"offset"`
+	Length int   `json:"length"`
+}
+
+type Fragment struct {
+	Packet int    `json:"packet"`
+	Seq    uint32 `json:"seq"`
+	Offset int64  `json:"offset"`
+	Data   []byte `json:"data"`
+}
+
 type BlockKind int
 
 const (
 	BlockData BlockKind = iota
 	BlockGap
+	BlockConflict
 )
 
 type Block struct {
-	Kind   BlockKind
-	Data   []byte
-	Length int
+	Kind         BlockKind  `json:"kind"`
+	Data         []byte     `json:"data,omitempty"`
+	Length       int        `json:"length"`
+	Offset       int64      `json:"offset"`
+	Alternatives [][]byte   `json:"alternatives,omitempty"`
+	Sources      []Fragment `json:"sources,omitempty"`
+}
+
+const (
+	CandidateFirstObserved = "first_observed"
+	CandidateLastObserved  = "last_observed"
+)
+
+type StreamCandidate struct {
+	Rule   string  `json:"rule"`
+	Bytes  []byte  `json:"bytes"`
+	Blocks []Block `json:"blocks"`
+}
+
+type Message struct {
+	Data        []byte `json:"data"`
+	StartOffset int64  `json:"start_offset"`
+	EndOffset   int64  `json:"end_offset"`
 }
 
 type StreamResult struct {
-	Direction Direction
-	ISN       uint32
-	NextSeq   uint32
-	FINSeq    uint32
-	Closed    bool
-	Bytes     []byte
-	Blocks    []Block
-	Gaps      []Gap
-	Received  int
+	Direction        Direction         `json:"direction"`
+	ISN              uint32            `json:"isn"`
+	NextSeq          uint32            `json:"next_seq"`
+	FINSeq           uint32            `json:"fin_seq"`
+	Closed           bool              `json:"closed"`
+	Bytes            []byte            `json:"bytes"`
+	Blocks           []Block           `json:"blocks"`
+	Gaps             []Gap             `json:"gaps"`
+	IncompleteRanges []ByteRange       `json:"incomplete_ranges"`
+	UncertainRanges  []ByteRange       `json:"uncertain_ranges"`
+	AvailableRanges  []ByteRange       `json:"available_ranges"`
+	Fragments        []Fragment        `json:"fragments"`
+	Candidates       []StreamCandidate `json:"candidates"`
+	Received         int               `json:"received"`
 }
 
 func (s StreamResult) Complete() bool {
-	return s.Closed && len(s.Gaps) == 0
+	return s.Closed && len(s.Gaps) == 0 && len(s.UncertainRanges) == 0
+}
+
+func (s StreamResult) Candidate(rule string) (StreamCandidate, bool) {
+	for _, candidate := range s.Candidates {
+		if candidate.Rule == rule {
+			return candidate, true
+		}
+	}
+	return StreamCandidate{}, false
+}
+
+func (s StreamResult) Messages(delim byte) []Message {
+	var messages []Message
+	var run []byte
+	runStart := int64(-1)
+	flush := func() {
+		start := int64(-1)
+		for i, b := range run {
+			position := runStart + int64(i)
+			if b != delim {
+				if start < 0 {
+					start = position
+				}
+				continue
+			}
+			if start < 0 {
+				if runStart != 0 {
+					continue
+				}
+				start = position
+			}
+			messages = append(messages, Message{
+				Data:        append([]byte(nil), run[start-runStart:i]...),
+				StartOffset: start,
+				EndOffset:   position + 1,
+			})
+			start = -1
+		}
+		run = nil
+		runStart = -1
+	}
+	for _, block := range s.Blocks {
+		if block.Kind == BlockData {
+			if runStart < 0 {
+				runStart = block.Offset
+			}
+			if block.Offset == runStart+int64(len(run)) {
+				run = append(run, block.Data...)
+				continue
+			}
+		}
+		flush()
+	}
+	flush()
+	return messages
 }
 
 type SessionState string
