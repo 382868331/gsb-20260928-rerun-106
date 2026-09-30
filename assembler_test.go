@@ -132,6 +132,107 @@ func TestMissingSegmentMarksGapWithoutZeroFill(t *testing.T) {
 	}
 }
 
+func TestOverlapConflictPreservesCandidateStreams(t *testing.T) {
+	cISN := uint32(100)
+	sISN := uint32(200)
+	frames := []TCPFrameSpec{
+		goldenFrame(zeroTime(0), true, cISN, sISN, 0x02, nil, 1),
+		goldenFrame(zeroTime(1), false, sISN, cISN+1, 0x12, nil, 1),
+		goldenFrame(zeroTime(2), true, cISN+1, sISN+1, 0x10, nil, 1),
+		goldenFrame(zeroTime(3), false, sISN+1, cISN+1, 0x18, []byte("AAA!"), 2),
+		goldenFrame(zeroTime(4), false, sISN+1, cISN+1, 0x18, []byte("XBA!"), 3),
+		goldenFrame(zeroTime(5), false, sISN, cISN+5, 0x11, nil, 4),
+	}
+	sess := ingestFrames(t, frames, DefaultLimits())
+	result := sess.Result(DirectionServerToClient)
+	if !bytes.Equal(result.Bytes, []byte("AAA!")) {
+		t.Fatalf("canonical bytes = %q, want first observed", result.Bytes)
+	}
+	if len(result.UncertainRanges) != 1 || result.UncertainRanges[0] != (ByteRange{Start: 0, End: 2}) {
+		t.Fatalf("uncertain ranges = %#v, want 0:2", result.UncertainRanges)
+	}
+	first := result.Candidates[0]
+	last := result.Candidates[1]
+	if first.Rule != CandidateFirstObserved || !bytes.Equal(first.Bytes, []byte("AAA!")) {
+		t.Fatalf("first candidate = %#v", first)
+	}
+	if last.Rule != CandidateLastObserved || !bytes.Equal(last.Bytes, []byte("XBA!")) {
+		t.Fatalf("last candidate = %#v", last)
+	}
+	hasConflict := false
+	for _, ev := range sess.Evidence {
+		hasConflict = hasConflict || ev.Kind == EvidenceOverlapConflict
+	}
+	if !hasConflict {
+		t.Fatal("missing overlap conflict evidence")
+	}
+}
+
+func TestApplicationParserStopsAtGapAndAmbiguity(t *testing.T) {
+	cISN := uint32(100)
+	sISN := uint32(200)
+	frames := []TCPFrameSpec{
+		goldenFrame(zeroTime(0), true, cISN, sISN, 0x02, nil, 1),
+		goldenFrame(zeroTime(1), false, sISN, cISN+1, 0x12, nil, 1),
+		goldenFrame(zeroTime(2), true, cISN+1, sISN+1, 0x10, nil, 1),
+		goldenFrame(zeroTime(3), false, sISN+1, cISN+1, 0x18, []byte("OK\n"), 2),
+		goldenFrame(zeroTime(4), false, sISN+7, cISN+1, 0x18, []byte("BAD\n"), 3),
+		goldenFrame(zeroTime(5), false, sISN+7, cISN+1, 0x18, []byte("BXD\n"), 4),
+	}
+	sess := ingestFrames(t, frames, DefaultLimits())
+	messages, err := ParseApplicationMessages(sess.Result(DirectionServerToClient), []byte("\n"), 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 4 || !bytes.Equal(messages[0].Data, []byte("OK")) || !messages[0].Complete {
+		t.Fatalf("first message = %#v", messages)
+	}
+	if messages[1].BlockedRange == nil || len(messages[1].Data) != 0 || messages[1].BlockedRange.Start != 3 || messages[1].BlockedRange.End != 6 {
+		t.Fatalf("gap should be reported without crossing it, got %#v", messages)
+	}
+	if messages[2].BlockedRange == nil || !bytes.Equal(messages[2].Data, []byte("B")) || messages[2].BlockedRange.Start != 7 || messages[2].BlockedRange.End != 8 {
+		t.Fatalf("ambiguous message should stop at conflict, got %#v", messages)
+	}
+	if !bytes.Equal(messages[3].Data, []byte("D")) || !messages[3].Complete || messages[3].StartOffset != 8 {
+		t.Fatalf("message after conflict must be independent, got %#v", messages)
+	}
+}
+
+func TestBudgetExhaustionExportAndImportPreservesUncertainty(t *testing.T) {
+	limits := DefaultLimits()
+	limits.MaxStreamBytes = 3
+	a := NewAssembler(limits)
+	cISN := uint32(100)
+	sISN := uint32(200)
+	frames := []TCPFrameSpec{
+		goldenFrame(zeroTime(0), true, cISN, sISN, 0x02, nil, 1),
+		goldenFrame(zeroTime(1), false, sISN, cISN+1, 0x12, nil, 1),
+		goldenFrame(zeroTime(2), true, cISN+1, sISN+1, 0x10, nil, 1),
+		goldenFrame(zeroTime(3), false, sISN+1, cISN+1, 0x18, []byte("AAA"), 2),
+		goldenFrame(zeroTime(4), false, sISN+1, cISN+1, 0x18, []byte("XXXZ"), 3),
+	}
+	err := ingestAll(a, mustReadFrames(t, frames))
+	if !errors.Is(err, ErrStreamBudgetExhausted) {
+		t.Fatalf("error = %v, want stream budget", err)
+	}
+	data, err := a.Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := ImportAssembler(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := a.Sessions()[0].Result(DirectionServerToClient)
+	after := restored.Sessions()[0].Result(DirectionServerToClient)
+	if !bytes.Equal(before.Bytes, after.Bytes) || len(before.Candidates) != len(after.Candidates) {
+		t.Fatalf("restored uncertainty differs: before=%#v after=%#v", before, after)
+	}
+	if !bytes.Equal(after.Candidates[0].Bytes, []byte("AAAZ")) || !bytes.Equal(after.Candidates[1].Bytes, []byte("XXXZ")) {
+		t.Fatalf("restored candidates = %#v", after.Candidates)
+	}
+}
+
 func TestBudgets(t *testing.T) {
 	t.Run("packets", func(t *testing.T) {
 		limits := DefaultLimits()

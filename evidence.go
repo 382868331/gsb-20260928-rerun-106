@@ -120,28 +120,75 @@ type BlockKind int
 const (
 	BlockData BlockKind = iota
 	BlockGap
+	BlockAmbiguous
 )
 
 type Block struct {
-	Kind   BlockKind
-	Data   []byte
-	Length int
+	Kind        BlockKind
+	Data        []byte
+	Length      int
+	StartOffset int64
+	Packet      int
 }
 
 type StreamResult struct {
-	Direction Direction
-	ISN       uint32
-	NextSeq   uint32
-	FINSeq    uint32
-	Closed    bool
-	Bytes     []byte
-	Blocks    []Block
-	Gaps      []Gap
-	Received  int
+	Direction        Direction
+	ISN              uint32
+	NextSeq          uint32
+	FINSeq           uint32
+	Closed           bool
+	Bytes            []byte
+	Blocks           []Block
+	Gaps             []Gap
+	Received         int
+	Candidates       []CandidateStream
+	UncertainRanges  []ByteRange
+	IncompleteRanges []IncompleteRange
+}
+
+type CandidateRule string
+
+const (
+	CandidateFirstObserved CandidateRule = "first_observed"
+	CandidateLastObserved  CandidateRule = "last_observed"
+)
+
+type CandidateStream struct {
+	Rule   CandidateRule
+	Bytes  []byte
+	Blocks []Block
+}
+
+type ByteRange struct {
+	Start int64 `json:"start"`
+	End   int64 `json:"end"`
+}
+
+type IncompleteRange struct {
+	Start  int64  `json:"start"`
+	End    int64  `json:"end"`
+	Reason string `json:"reason"`
+}
+
+type ApplicationMessage struct {
+	Data         []byte           `json:"data"`
+	StartOffset  int64            `json:"start_offset"`
+	EndOffset    int64            `json:"end_offset"`
+	Complete     bool             `json:"complete"`
+	BlockedRange *IncompleteRange `json:"blocked_range,omitempty"`
 }
 
 func (s StreamResult) Complete() bool {
 	return s.Closed && len(s.Gaps) == 0
+}
+
+func (s StreamResult) Candidate(rule CandidateRule) (CandidateStream, bool) {
+	for _, candidate := range s.Candidates {
+		if candidate.Rule == rule {
+			return candidate, true
+		}
+	}
+	return CandidateStream{}, false
 }
 
 type SessionState string
