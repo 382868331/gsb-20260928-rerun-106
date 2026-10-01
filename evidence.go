@@ -17,6 +17,7 @@ const (
 	EvidenceOverlapConflict EvidenceKind = "overlap_conflict"
 	EvidenceLateSegment     EvidenceKind = "late_segment"
 	EvidenceGap             EvidenceKind = "gap"
+	EvidenceAckConfirmation EvidenceKind = "ack_confirmation"
 	EvidenceBudgetExhausted EvidenceKind = "budget_exhausted"
 	EvidenceHandshake       EvidenceKind = "handshake"
 	EvidenceConnectionClose EvidenceKind = "connection_close"
@@ -81,13 +82,14 @@ func (f TCPFlags) String() string {
 }
 
 type Evidence struct {
-	Kind      EvidenceKind
-	Packet    int
-	Direction Direction
-	Sequence  uint32
-	Offset    int64
-	Length    int
-	Detail    string
+	Kind                   EvidenceKind `json:"kind"`
+	Packet                 int          `json:"packet"`
+	Direction              Direction    `json:"direction"`
+	AcknowledgingDirection Direction    `json:"acknowledging_direction,omitempty"`
+	Sequence               uint32       `json:"sequence"`
+	Offset                 int64        `json:"offset"`
+	Length                 int          `json:"length"`
+	Detail                 string       `json:"detail,omitempty"`
 }
 
 type Endpoint struct {
@@ -109,10 +111,12 @@ func (k SessionKey) String() string {
 }
 
 type Gap struct {
-	Direction Direction
-	StartSeq  uint32
-	Length    int
-	Offset    int64
+	Direction        Direction `json:"direction"`
+	StartSeq         uint32    `json:"start_seq"`
+	Length           int       `json:"length"`
+	Offset           int64     `json:"offset"`
+	Acknowledged     bool      `json:"acknowledged,omitempty"`
+	ConfirmingPacket int       `json:"confirming_packet,omitempty"`
 }
 
 type ByteRange struct {
@@ -156,9 +160,20 @@ type StreamCandidate struct {
 }
 
 type Message struct {
-	Data        []byte `json:"data"`
-	StartOffset int64  `json:"start_offset"`
-	EndOffset   int64  `json:"end_offset"`
+	Data             []byte      `json:"data"`
+	StartOffset      int64       `json:"start_offset"`
+	EndOffset        int64       `json:"end_offset"`
+	Sources          []Fragment  `json:"sources,omitempty"`
+	UnresolvedRanges []ByteRange `json:"unresolved_ranges,omitempty"`
+}
+
+type Interpretation struct {
+	Direction        Direction   `json:"direction"`
+	Rule             string      `json:"rule"`
+	Blocks           []Block     `json:"blocks"`
+	Messages         []Message   `json:"messages"`
+	AdoptedRanges    []ByteRange `json:"adopted_ranges"`
+	UnresolvedRanges []ByteRange `json:"unresolved_ranges"`
 }
 
 type StreamResult struct {
@@ -192,49 +207,24 @@ func (s StreamResult) Candidate(rule string) (StreamCandidate, bool) {
 }
 
 func (s StreamResult) Messages(delim byte) []Message {
-	var messages []Message
-	var run []byte
-	runStart := int64(-1)
-	flush := func() {
-		start := int64(-1)
-		for i, b := range run {
-			position := runStart + int64(i)
-			if b != delim {
-				if start < 0 {
-					start = position
-				}
-				continue
-			}
-			if start < 0 {
-				if runStart != 0 {
-					continue
-				}
-				start = position
-			}
-			messages = append(messages, Message{
-				Data:        append([]byte(nil), run[start-runStart:i]...),
-				StartOffset: start,
-				EndOffset:   position + 1,
-			})
-			start = -1
+	blocks := append([]Block(nil), s.Blocks...)
+	for i := range blocks {
+		if blocks[i].Kind == BlockData && len(blocks[i].Sources) == 0 {
+			blocks[i].Sources = fragmentsCovering(s.Fragments, blocks[i].Offset, blocks[i].Length)
 		}
-		run = nil
-		runStart = -1
 	}
-	for _, block := range s.Blocks {
-		if block.Kind == BlockData {
-			if runStart < 0 {
-				runStart = block.Offset
-			}
-			if block.Offset == runStart+int64(len(run)) {
-				run = append(run, block.Data...)
-				continue
-			}
+	return messagesFromBlocks(blocks, delim)
+}
+
+func fragmentsCovering(fragments []Fragment, start int64, length int) []Fragment {
+	var out []Fragment
+	end := start + int64(length)
+	for _, frag := range fragments {
+		if frag.Offset <= start && frag.Offset+int64(len(frag.Data)) >= end {
+			out = append(out, frag)
 		}
-		flush()
 	}
-	flush()
-	return messages
+	return out
 }
 
 type SessionState string
@@ -247,18 +237,19 @@ const (
 )
 
 type Session struct {
-	ID        string
-	Key       SessionKey
-	ClientISN uint32
-	ServerISN uint32
-	State     SessionState
-	Start     time.Time
-	End       time.Time
-	Client    *stream
-	Server    *stream
-	Raw       []RawPacket
-	Packets   []int
-	Evidence  []Evidence
+	ID         string       `json:"id"`
+	Key        SessionKey   `json:"key"`
+	Generation int          `json:"generation"`
+	ClientISN  uint32       `json:"client_isn"`
+	ServerISN  uint32       `json:"server_isn"`
+	State      SessionState `json:"state"`
+	Start      time.Time    `json:"start"`
+	End        time.Time    `json:"end"`
+	Client     *stream      `json:"-"`
+	Server     *stream      `json:"-"`
+	Raw        []RawPacket  `json:"raw_packets"`
+	Packets    []int        `json:"packets"`
+	Evidence   []Evidence   `json:"evidence"`
 }
 
 func (s *Session) Result(direction Direction) StreamResult {

@@ -84,6 +84,9 @@ func TestReusedAddressCreatesIsolatedSession(t *testing.T) {
 	if sessions[0].ID == sessions[1].ID || sessions[0].Key != sessions[1].Key {
 		t.Fatalf("reused address should produce distinct identities for same key: %+v", sessions)
 	}
+	if sessions[0].Generation != 1 || sessions[1].Generation != 2 {
+		t.Fatalf("generations = %d,%d, want 1,2", sessions[0].Generation, sessions[1].Generation)
+	}
 	newClient := sessions[1].Result(DirectionClientToServer)
 	if !bytes.Equal(newClient.Bytes, []byte("NEW")) {
 		t.Fatalf("new client payload = %q, want NEW", newClient.Bytes)

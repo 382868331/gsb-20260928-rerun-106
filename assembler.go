@@ -106,6 +106,7 @@ func (a *Assembler) Ingest(p RawPacket) error {
 		return nil
 	}
 	sess.Raw = append(sess.Raw, cloneRawPacket(p))
+	sess.recordACK(p)
 
 	var st *stream
 	var direction Direction
@@ -146,13 +147,14 @@ func (a *Assembler) startSession(p RawPacket) error {
 		return ErrSessionBudgetExhausted
 	}
 	sess := &Session{
-		ID:        fmt.Sprintf("tcp-%06d", atomic.LoadInt64(&a.stats.Sessions)),
-		Key:       key,
-		ClientISN: p.Seq,
-		State:     StateNew,
-		Start:     p.Timestamp,
-		Client:    newStream(p.Seq, a),
-		Server:    newStream(0, a),
+		ID:         fmt.Sprintf("tcp-%06d-gen-%02d", atomic.LoadInt64(&a.stats.Sessions), len(a.sessions[key])+1),
+		Key:        key,
+		Generation: len(a.sessions[key]) + 1,
+		ClientISN:  p.Seq,
+		State:      StateNew,
+		Start:      p.Timestamp,
+		Client:     newStream(p.Seq, a),
+		Server:     newStream(0, a),
 	}
 	sess.Raw = append(sess.Raw, cloneRawPacket(p))
 	sess.addEvidence(Evidence{Kind: EvidenceHandshake, Packet: p.Index, Direction: DirectionClientToServer, Sequence: p.Seq, Detail: "SYN"})
@@ -217,11 +219,22 @@ func (s *Session) addEvidence(e Evidence) {
 	s.Evidence = append(s.Evidence, e)
 }
 
+func (s *Session) recordACK(p RawPacket) {
+	if !p.Flags.ACK {
+		return
+	}
+	if p.SrcIP == s.Key.Client.IP && p.SrcPort == s.Key.Client.Port {
+		s.Server.markACK(s, p, DirectionServerToClient, DirectionClientToServer)
+		return
+	}
+	s.Client.markACK(s, p, DirectionClientToServer, DirectionServerToClient)
+}
+
 type segment struct {
-	seq    uint32
-	data   []byte
-	packet int
-	offset int64
+	Seq    uint32 `json:"seq"`
+	Data   []byte `json:"data"`
+	Packet int    `json:"packet"`
+	Offset int64  `json:"offset"`
 }
 
 type stream struct {
@@ -233,6 +246,7 @@ type stream struct {
 	pending       []segment
 	chunks        map[int64][]byte
 	observations  []Fragment
+	gaps          []Gap
 	incomplete    []ByteRange
 	evidenceCount map[EvidenceKind]int
 	maxOffset     int64
@@ -313,15 +327,16 @@ func (s *stream) ingest(p RawPacket, direction Direction, sess *Session) error {
 		suspension := rel32(s.next, start)
 		if suspension > 0 {
 			gap := Gap{Direction: direction, StartSeq: s.next, Length: int(suspension), Offset: int64(rel32(s.isn+1, s.next))}
+			s.gaps = addGapResultList(s.gaps, gap)
 			sess.addEvidence(Evidence{Kind: EvidenceGap, Packet: p.Index, Direction: direction, Sequence: s.next, Length: gap.Length, Offset: gap.Offset, Detail: fmt.Sprintf("missing %d bytes before sequence %d", gap.Length, start)})
 		}
 		if idx := s.findPendingOverlap(start, end); idx >= 0 {
 			existing := s.pending[idx]
-			overlapStart := maxRel(relStart, existing.offset)
-			overlapEnd := minRel(relStart+int64(len(data)), existing.offset+int64(len(existing.data)))
+			overlapStart := maxRel(relStart, existing.Offset)
+			overlapEnd := minRel(relStart+int64(len(data)), existing.Offset+int64(len(existing.Data)))
 			overlapLength := int(overlapEnd - overlapStart)
 			newPart := data[overlapStart-relStart:]
-			existingPart := existing.data[overlapStart-existing.offset:]
+			existingPart := existing.Data[overlapStart-existing.Offset:]
 			detail := "duplicate out-of-order segment"
 			kind := EvidenceRetransmission
 			if !bytesEqual(existingPart[:overlapLength], newPart[:overlapLength]) {
@@ -338,7 +353,7 @@ func (s *stream) ingest(p RawPacket, direction Direction, sess *Session) error {
 			return ErrPendingBudgetExhausted
 		}
 		s.observations = append(s.observations, Fragment{Packet: p.Index, Seq: start, Offset: relStart, Data: append([]byte(nil), data...)})
-		s.pending = append(s.pending, segment{seq: start, data: append([]byte(nil), data...), packet: p.Index, offset: relStart})
+		s.pending = append(s.pending, segment{Seq: start, Data: append([]byte(nil), data...), Packet: p.Index, Offset: relStart})
 		s.a.pendingDelta(int64(len(data)))
 		sess.addEvidence(Evidence{Kind: EvidenceOutOfOrder, Packet: p.Index, Direction: direction, Sequence: start, Length: len(data), Offset: relStart})
 		if relEnd > s.maxOffset {
@@ -364,6 +379,8 @@ func (s *stream) acceptInOrder(sess *Session, p RawPacket, direction Direction, 
 		return ErrStreamBudgetExhausted
 	}
 	s.chunks[relStart] = append([]byte(nil), data...)
+	filled := ByteRange{Offset: relStart, Length: len(data)}
+	s.gaps = subtractGapRanges(s.gaps, filled)
 	s.received += len(data)
 	atomic.AddInt64(&s.a.stats.AcceptedBytes, int64(len(data)))
 	s.next = addSeq(start, uint32(len(data)))
@@ -371,6 +388,29 @@ func (s *stream) acceptInOrder(sess *Session, p RawPacket, direction Direction, 
 		s.maxOffset = relStart + int64(len(data))
 	}
 	return nil
+}
+
+func (s *stream) markACK(sess *Session, p RawPacket, target, acknowledging Direction) {
+	if !s.isnSet {
+		return
+	}
+	ackedLength := rel32(s.isn+1, p.Ack)
+	if ackedLength <= 0 {
+		return
+	}
+	changed := false
+	for i := range s.gaps {
+		gap := &s.gaps[i]
+		end := gap.Offset + int64(gap.Length)
+		if !gap.Acknowledged && end <= ackedLength {
+			gap.Acknowledged = true
+			gap.ConfirmingPacket = p.Index
+			changed = true
+		}
+	}
+	if changed {
+		sess.addEvidence(Evidence{Kind: EvidenceAckConfirmation, Packet: p.Index, Direction: target, AcknowledgingDirection: acknowledging, Sequence: p.Ack, Length: int(ackedLength), Detail: "opposite direction acknowledges bytes across a captured gap"})
+	}
 }
 
 func (s *stream) drainPending(sess *Session, direction Direction) error {
@@ -381,23 +421,23 @@ func (s *stream) drainPending(sess *Session, direction Direction) error {
 		}
 		seg := s.pending[idx]
 		cut := 0
-		if seqBefore(seg.seq, s.next) {
-			cut = int(rel32(seg.seq, s.next))
-			prefix := seg.data[:cut]
-			s.evidenceOverlap(sess, RawPacket{Index: seg.packet, Seq: seg.seq, Payload: prefix}, direction, prefix, seg.offset, cut < len(seg.data))
-			seg.seq = s.next
-			seg.offset = int64(rel32(s.isn+1, s.next))
-			seg.data = seg.data[cut:]
+		if seqBefore(seg.Seq, s.next) {
+			cut = int(rel32(seg.Seq, s.next))
+			prefix := seg.Data[:cut]
+			s.evidenceOverlap(sess, RawPacket{Index: seg.Packet, Seq: seg.Seq, Payload: prefix}, direction, prefix, seg.Offset, cut < len(seg.Data))
+			seg.Seq = s.next
+			seg.Offset = int64(rel32(s.isn+1, s.next))
+			seg.Data = seg.Data[cut:]
 			s.pending[idx] = seg
 		}
-		if len(seg.data) == 0 {
+		if len(seg.Data) == 0 {
 			s.pending = append(s.pending[:idx], s.pending[idx+1:]...)
 			s.a.pendingDelta(-int64(cut))
 			continue
 		}
 		s.pending = append(s.pending[:idx], s.pending[idx+1:]...)
-		s.a.pendingDelta(-int64(len(seg.data) + cut))
-		if err := s.acceptInOrder(sess, RawPacket{Index: seg.packet, Seq: seg.seq}, direction, seg.seq, seg.data, seg.offset); err != nil {
+		s.a.pendingDelta(-int64(len(seg.Data) + cut))
+		if err := s.acceptInOrder(sess, RawPacket{Index: seg.Packet, Seq: seg.Seq}, direction, seg.Seq, seg.Data, seg.Offset); err != nil {
 			return err
 		}
 	}
@@ -405,7 +445,7 @@ func (s *stream) drainPending(sess *Session, direction Direction) error {
 
 func (s *stream) findPending(seq uint32) int {
 	for i, seg := range s.pending {
-		if seg.seq == seq {
+		if seg.Seq == seq {
 			return i
 		}
 	}
@@ -414,8 +454,8 @@ func (s *stream) findPending(seq uint32) int {
 
 func (s *stream) findPendingOverlap(start, end uint32) int {
 	for i, seg := range s.pending {
-		segEnd := addSeq(seg.seq, uint32(len(seg.data)))
-		if start == seg.seq || (seqBefore(start, segEnd) && seqBefore(seg.seq, end)) {
+		segEnd := addSeq(seg.Seq, uint32(len(seg.Data)))
+		if start == seg.Seq || (seqBefore(start, segEnd) && seqBefore(seg.Seq, end)) {
 			return i
 		}
 	}
@@ -438,8 +478,8 @@ func minRel(a, b int64) int64 {
 
 func (s *stream) findPendingStartingAtOrBefore(seq uint32) int {
 	for i, seg := range s.pending {
-		end := addSeq(seg.seq, uint32(len(seg.data)))
-		if seg.seq == seq || (seqBefore(seg.seq, seq) && seqBefore(seq, end)) {
+		end := addSeq(seg.Seq, uint32(len(seg.Data)))
+		if seg.Seq == seq || (seqBefore(seg.Seq, seq) && seqBefore(seq, end)) {
 			return i
 		}
 	}
@@ -576,7 +616,7 @@ func (s *stream) materialize(direction Direction) ([]Block, []StreamCandidate, [
 
 	var primary []Block
 	var firstBlocks, lastBlocks []Block
-	var gaps []Gap
+	gaps := append([]Gap(nil), s.gaps...)
 	var covered []ByteRange
 	var uncertain []ByteRange
 	for i := 0; i+1 < len(boundaries); i++ {
@@ -591,7 +631,8 @@ func (s *stream) materialize(direction Direction) ([]Block, []StreamCandidate, [
 			primary = append(primary, block)
 			firstBlocks = append(firstBlocks, block)
 			lastBlocks = append(lastBlocks, block)
-			gaps = append(gaps, Gap{Direction: direction, StartSeq: addSeq(s.isn+1, uint32(start)), Length: length, Offset: start})
+			gap := Gap{Direction: direction, StartSeq: addSeq(s.isn+1, uint32(start)), Length: length, Offset: start}
+			gaps = addGapResultList(gaps, gap)
 			uncertain = appendRange(uncertain, start, length)
 			continue
 		}
@@ -606,8 +647,8 @@ func (s *stream) materialize(direction Direction) ([]Block, []StreamCandidate, [
 		}
 		firstBytes := fragmentBytes(first, start, length)
 		lastBytes := fragmentBytes(last, start, length)
-		firstBlocks = append(firstBlocks, Block{Kind: BlockData, Offset: start, Data: firstBytes, Length: length})
-		lastBlocks = append(lastBlocks, Block{Kind: BlockData, Offset: start, Data: lastBytes, Length: length})
+		firstBlocks = append(firstBlocks, Block{Kind: BlockData, Offset: start, Data: firstBytes, Length: length, Sources: []Fragment{first}})
+		lastBlocks = append(lastBlocks, Block{Kind: BlockData, Offset: start, Data: lastBytes, Length: length, Sources: []Fragment{last}})
 		covered = appendRange(covered, start, length)
 		if bytesEqual(firstBytes, lastBytes) && allSame(active, start, length, firstBytes) {
 			primary = append(primary, Block{Kind: BlockData, Offset: start, Data: append([]byte(nil), firstBytes...), Length: length, Sources: append([]Fragment(nil), active...)})
@@ -787,6 +828,37 @@ func appendGap(gaps []Gap, gap Gap) []Gap {
 		}
 	}
 	return append(gaps, gap)
+}
+
+func addGapResultList(gaps []Gap, gap Gap) []Gap {
+	for _, existing := range gaps {
+		if existing.Offset == gap.Offset && existing.Length == gap.Length {
+			return gaps
+		}
+	}
+	return append(gaps, gap)
+}
+
+func subtractGapRanges(gaps []Gap, filled ByteRange) []Gap {
+	var out []Gap
+	fillEnd := filled.Offset + int64(filled.Length)
+	for _, gap := range gaps {
+		end := gap.Offset + int64(gap.Length)
+		if end <= filled.Offset || gap.Offset >= fillEnd {
+			out = append(out, gap)
+			continue
+		}
+		if filled.Offset <= gap.Offset && fillEnd >= end {
+			continue
+		}
+		if gap.Offset < filled.Offset {
+			out = append(out, Gap{Direction: gap.Direction, StartSeq: gap.StartSeq, Length: int(filled.Offset - gap.Offset), Offset: gap.Offset, Acknowledged: gap.Acknowledged, ConfirmingPacket: gap.ConfirmingPacket})
+		}
+		if end > fillEnd {
+			out = append(out, Gap{Direction: gap.Direction, StartSeq: addSeq(gap.StartSeq, uint32(fillEnd-gap.Offset)), Length: int(end - fillEnd), Offset: fillEnd, Acknowledged: gap.Acknowledged, ConfirmingPacket: gap.ConfirmingPacket})
+		}
+	}
+	return out
 }
 
 func addGapResult(gaps *[]Gap, gap Gap) {
