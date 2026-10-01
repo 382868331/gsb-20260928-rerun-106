@@ -115,6 +115,13 @@ func (a *Assembler) Ingest(p RawPacket) error {
 	} else {
 		st, direction = sess.Server, DirectionServerToClient
 	}
+	peer := sess.Server
+	peerDirection := DirectionServerToClient
+	if direction == DirectionServerToClient {
+		peer = sess.Client
+		peerDirection = DirectionClientToServer
+	}
+	peer.confirmAck(sess, p, peerDirection)
 	if err := st.ingest(p, direction, sess); err != nil {
 		sess.addEvidence(Evidence{Kind: EvidenceBudgetExhausted, Packet: p.Index, Direction: direction, Sequence: p.Seq, Detail: err.Error()})
 		atomic.AddInt64(&a.stats.BudgetStops, 1)
@@ -237,6 +244,7 @@ type stream struct {
 	evidenceCount map[EvidenceKind]int
 	maxOffset     int64
 	received      int
+	peerAcked     int64
 	a             *Assembler
 }
 
@@ -543,6 +551,8 @@ func (s *stream) result(direction Direction) StreamResult {
 		AvailableRanges:  available,
 		Fragments:        fragments,
 		Candidates:       candidates,
+		PeerAckedRanges:  s.peerAckedRanges(),
+		PeerAckedMissing: intersectRanges(s.peerAckedRanges(), append(gapsToRanges(gaps), s.incomplete...)),
 		Received:         s.received,
 	}
 }
@@ -606,8 +616,8 @@ func (s *stream) materialize(direction Direction) ([]Block, []StreamCandidate, [
 		}
 		firstBytes := fragmentBytes(first, start, length)
 		lastBytes := fragmentBytes(last, start, length)
-		firstBlocks = append(firstBlocks, Block{Kind: BlockData, Offset: start, Data: firstBytes, Length: length})
-		lastBlocks = append(lastBlocks, Block{Kind: BlockData, Offset: start, Data: lastBytes, Length: length})
+		firstBlocks = append(firstBlocks, Block{Kind: BlockData, Offset: start, Data: firstBytes, Length: length, Sources: append([]Fragment(nil), active...)})
+		lastBlocks = append(lastBlocks, Block{Kind: BlockData, Offset: start, Data: lastBytes, Length: length, Sources: append([]Fragment(nil), active...)})
 		covered = appendRange(covered, start, length)
 		if bytesEqual(firstBytes, lastBytes) && allSame(active, start, length, firstBytes) {
 			primary = append(primary, Block{Kind: BlockData, Offset: start, Data: append([]byte(nil), firstBytes...), Length: length, Sources: append([]Fragment(nil), active...)})

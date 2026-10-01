@@ -18,6 +18,7 @@ const (
 	EvidenceLateSegment     EvidenceKind = "late_segment"
 	EvidenceGap             EvidenceKind = "gap"
 	EvidenceBudgetExhausted EvidenceKind = "budget_exhausted"
+	EvidencePeerConfirm     EvidenceKind = "peer_confirm"
 	EvidenceHandshake       EvidenceKind = "handshake"
 	EvidenceConnectionClose EvidenceKind = "connection_close"
 )
@@ -175,6 +176,8 @@ type StreamResult struct {
 	AvailableRanges  []ByteRange       `json:"available_ranges"`
 	Fragments        []Fragment        `json:"fragments"`
 	Candidates       []StreamCandidate `json:"candidates"`
+	PeerAckedRanges  []ByteRange       `json:"peer_acked_ranges,omitempty"`
+	PeerAckedMissing []ByteRange       `json:"peer_acked_missing,omitempty"`
 	Received         int               `json:"received"`
 }
 
@@ -192,6 +195,10 @@ func (s StreamResult) Candidate(rule string) (StreamCandidate, bool) {
 }
 
 func (s StreamResult) Messages(delim byte) []Message {
+	return parseMessages(s.Blocks, delim)
+}
+
+func parseMessages(blocks []Block, delim byte) []Message {
 	var messages []Message
 	var run []byte
 	runStart := int64(-1)
@@ -221,7 +228,7 @@ func (s StreamResult) Messages(delim byte) []Message {
 		run = nil
 		runStart = -1
 	}
-	for _, block := range s.Blocks {
+	for _, block := range blocks {
 		if block.Kind == BlockData {
 			if runStart < 0 {
 				runStart = block.Offset
