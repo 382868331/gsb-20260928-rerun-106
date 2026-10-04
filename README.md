@@ -15,6 +15,10 @@
 - `Interpret(rule)` 可选择 `first_observed` 或 `last_observed` 解释；上层消息保留采用片段来源，并继续列出未解决范围。
 - `SaveSnapshot`/`LoadAssemblerSnapshot` 可保存重开后继续处理，原始片段、候选和缺口状态保持不变。
 - `CompareStreamResults` 可在乱序补入、ACK 佐证或重开续处理后说明结论被加强、解决、失效或仍未解决。
+- `BranchSet` 支持解释分支：`Fork` 在重叠冲突处选择不同证据继续解析，共享的已确认内容在所有分支间保持一致，某分支的假设不会泄漏到兄弟分支。
+- `BranchChoice` 记录每次选择的 packet 与理由；`SaveBranchSet`/`LoadBranchSet` 保存重开后任一分支可继续，理由不丢失。
+- `CompareInterpretations` 并排比较两个分支，区分真实内容变化（`content_change`）、边界划分变化（`boundary_change`）和置信依据变化（`confidence_change`）。
+- `BranchSet.Reassess` 在补入字节或相反证据后指出哪些上层消息需要重新解释、哪些过去导出的结论仍可使用（置信加强不算失效）。
 - 包数、会话数、已接收流字节和乱序缓存字节预算。
 
 运行测试：

@@ -166,11 +166,17 @@ func CompareStreamResults(before, after StreamResult) Reassessment {
 		}
 	}
 	for _, r := range beforeData {
-		if containsRange(afterConflicts, r) {
-			result.Invalidated = append(result.Invalidated, ConclusionChange{Direction: after.Direction, Range: r, Status: ConclusionInvalidated, Detail: "a later observation conflicts with previously unique bytes"})
+		for _, conflict := range afterConflicts {
+			if rangesOverlap(r, conflict) {
+				result.Invalidated = append(result.Invalidated, ConclusionChange{Direction: after.Direction, Range: conflict, Status: ConclusionInvalidated, Detail: "a later observation conflicts with previously unique bytes"})
+			}
 		}
 	}
 	return result
+}
+
+func rangesOverlap(a, b ByteRange) bool {
+	return a.Offset < b.Offset+int64(b.Length) && b.Offset < a.Offset+int64(a.Length)
 }
 
 func rangeSet(gaps []Gap) map[ByteRange]bool {
