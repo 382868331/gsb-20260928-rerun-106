@@ -18,7 +18,8 @@
 - `BranchSet` 支持解释分支：`Fork` 在重叠冲突处选择不同证据继续解析，共享的已确认内容在所有分支间保持一致，某分支的假设不会泄漏到兄弟分支。
 - `BranchChoice` 记录每次选择的 packet 与理由；`SaveBranchSet`/`LoadBranchSet` 保存重开后任一分支可继续，理由不丢失。
 - `CompareInterpretations` 并排比较两个分支，区分真实内容变化（`content_change`）、边界划分变化（`boundary_change`）和置信依据变化（`confidence_change`）。
-- `BranchSet.Reassess` 在补入字节或相反证据后指出哪些上层消息需要重新解释、哪些过去导出的结论仍可使用（置信加强不算失效）。
+- `BranchSet.Reassess` 在消息层分别标记内容、边界和置信依据变化；旧结论按 `citable`、`annotation_required`、`reinterpret_required` 处置，并列出当前采用片段、新增支持/冲突范围。
+- `SaveBranchReassessment`/`LoadBranchReassessment` 保存重评依据；跨换行的原始片段按局部字节范围记录，佐证数量不会自动选择任一冲突分支。
 - 包数、会话数、已接收流字节和乱序缓存字节预算。
 
 运行测试：

@@ -81,6 +81,9 @@ func messagesFromBlocks(blocks []Block, delim byte) []Message {
 		for i, value := range block.Data {
 			position := block.Offset + int64(i)
 			if value == delim {
+				for _, source := range block.Sources {
+					addSource(source, position)
+				}
 				if runStart >= 0 {
 					messages = append(messages, Message{
 						Data:        append([]byte(nil), run...),

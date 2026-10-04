@@ -688,9 +688,6 @@ func appendDifferenceBoundaries(boundaries []int64, fragments []Fragment) []int6
 				valueDifferent := left.Data[pos-left.Offset] != right.Data[pos-right.Offset]
 				if valueDifferent != different {
 					boundaries = append(boundaries, pos)
-					if different {
-						boundaries = append(boundaries, pos)
-					}
 					different = valueDifferent
 				}
 			}

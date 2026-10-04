@@ -143,10 +143,14 @@ func TestBranchReassessMarksMessagesForReinterpretation(t *testing.T) {
 	if len(reassessed.Messages) != 2 {
 		t.Fatalf("impacts = %#v, want MSG1 and MSG2", reassessed.Messages)
 	}
-	for _, impact := range reassessed.Messages {
-		if impact.Reinterpret {
-			t.Fatalf("impacts = %#v, want both exported messages still usable", reassessed.Messages)
+	var msg2 *MessageImpact
+	for i := range reassessed.Messages {
+		if bytes.Equal(reassessed.Messages[i].Message.Data, []byte("MSG2")) {
+			msg2 = &reassessed.Messages[i]
 		}
+	}
+	if msg2 == nil || !msg2.Reinterpret {
+		t.Fatalf("impacts = %#v, want MSG2 reinterpreted because filling the gap removes its message boundary", reassessed.Messages)
 	}
 
 	// Contradicting evidence invalidates the exported MSG1 conclusion.
@@ -173,9 +177,85 @@ func TestBranchReassessMarksMessagesForReinterpretation(t *testing.T) {
 	}
 	for _, impact := range reassessed.Messages {
 		if bytes.Equal(impact.Message.Data, []byte("MSG2")) && impact.Reinterpret {
-			t.Fatalf("MSG2 must stay usable: %#v", impact)
+			t.Fatalf("MSG2 was already boundary-changed by the gap fill: %#v", impact)
 		}
 	}
+}
+
+func TestBranchReassessDistinguishesConfidenceAndBoundaryConflicts(t *testing.T) {
+	cISN := uint32(100)
+	sISN := uint32(200)
+	frames := append(handshakeFrames(cISN, sISN, 0),
+		goldenFrame(zeroTime(3), false, sISN+1, cISN+1, 0x18, []byte("A\nB\n"), 10),
+	)
+	a := NewAssembler(DefaultLimits())
+	if err := ingestAll(a, mustReadFrames(t, frames)); err != nil {
+		t.Fatal(err)
+	}
+	before := a.Sessions()[0].Result(DirectionServerToClient)
+	set := NewBranchSet(a.Sessions()[0].ID, DirectionServerToClient)
+
+	added := []TCPFrameSpec{goldenFrame(zeroTime(4), false, sISN+1, cISN+1, 0x18, []byte("A\nx\n"), 11)}
+	if err := ingestAll(a, mustReadFrames(t, added)); err != nil {
+		t.Fatal(err)
+	}
+	after := a.Sessions()[0].Result(DirectionServerToClient)
+	reassessment, err := set.Reassess(BaseBranchID, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reassessment.Messages) != 2 {
+		t.Fatalf("messages = %#v, want both old exported conclusions", reassessment.Messages)
+	}
+	messageA := reassessment.Messages[0]
+	if messageA.Status != MessageConclusionAnnotationRequired || messageA.Reinterpret {
+		t.Fatalf("A impact = %#v, want confidence annotation only", messageA)
+	}
+	if !hasMessageChange(messageA.ChangeKinds, MessageChangeConfidence) || hasMessageChange(messageA.ChangeKinds, MessageChangeContent) || hasMessageChange(messageA.ChangeKinds, MessageChangeBoundary) {
+		t.Fatalf("A changes = %#v, want confidence_change only", messageA.ChangeKinds)
+	}
+	if len(messageA.AdoptedSupport) != 2 || len(messageA.AddedSupport) != 1 || !bytes.Equal(messageA.AddedSupport[0].Fragment.Data, []byte("A\nx\n")) {
+		t.Fatalf("A evidence = adopted %#v added %#v", messageA.AdoptedSupport, messageA.AddedSupport)
+	}
+	wantSupport := ByteRange{Offset: 0, Length: 2}
+	if len(messageA.AddedSupport[0].Supports) != 1 || messageA.AddedSupport[0].Supports[0] != wantSupport {
+		t.Fatalf("added A support ranges = %#v, want %#v including newline", messageA.AddedSupport[0].Supports, wantSupport)
+	}
+
+	messageB := reassessment.Messages[1]
+	if messageB.Status != MessageConclusionReinterpretRequired || !messageB.Reinterpret {
+		t.Fatalf("B impact = %#v, want reinterpretation for local conflict", messageB)
+	}
+	if len(messageB.AddedSupport) != 1 || !hasMessageChange(messageB.ChangeKinds, MessageChangeContent) {
+		t.Fatalf("B impact = %#v, want content conflict from added fragment", messageB)
+	}
+	if len(messageB.AddedSupport[0].Conflicts) != 1 || messageB.AddedSupport[0].Conflicts[0] != (ByteRange{Offset: 2, Length: 1}) {
+		t.Fatalf("B conflict ranges = %#v, want local B-only conflict", messageB.AddedSupport[0].Conflicts)
+	}
+	if len(after.Blocks) != 3 {
+		t.Fatalf("after blocks = %#v, corroboration count must not select a branch fact", after.Blocks)
+	}
+
+	encoded, err := SaveBranchReassessment(reassessment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored, err := LoadBranchReassessment(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restored.Messages) != 2 || len(restored.Messages[0].AddedSupport) != 1 || !bytes.Equal(restored.Messages[0].AddedSupport[0].Fragment.Data, []byte("A\nx\n")) {
+		t.Fatalf("restored reassessment = %#v, want evidence retained", restored)
+	}
+}
+
+func hasMessageChange(kinds []MessageChangeKind, want MessageChangeKind) bool {
+	for _, kind := range kinds {
+		if kind == want {
+			return true
+		}
+	}
+	return false
 }
 
 // A saved branch set keeps its choice rationale; after reload, any branch
