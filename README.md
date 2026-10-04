@@ -18,7 +18,9 @@
 - `BranchSet` 支持解释分支：`Fork` 在重叠冲突处选择不同证据继续解析，共享的已确认内容在所有分支间保持一致，某分支的假设不会泄漏到兄弟分支。
 - `BranchChoice` 记录每次选择的 packet 与理由；`SaveBranchSet`/`LoadBranchSet` 保存重开后任一分支可继续，理由不丢失。
 - `CompareInterpretations` 并排比较两个分支，区分真实内容变化（`content_change`）、边界划分变化（`boundary_change`）和置信依据变化（`confidence_change`）。
-- `BranchSet.Reassess` 在补入字节或相反证据后指出哪些上层消息需要重新解释、哪些过去导出的结论仍可使用（置信加强不算失效）。
+- `BranchSet.Reassess` 在补入与某分支一致的原始报文后，在消息层区分 `content_change`（字节变化或变得不可唯一确定，必须重新解释）、`boundary_change`（字节一致但消息切分移动，必须重新解释）和 `confidence_change`（内容与边界不变但证据集合变化，结论可引用但需补注）；未受影响的消息标为 `unchanged` 可直接引用。
+- 每条重评结论都带 `usability`（`citable`/`needs_addendum`/`must_reinterpret`），并分别列出实际采用的原始片段（`adopted_fragments`）、新增加持片段（`added_support_fragments`）和新增矛盾片段（`contradicting_fragments`）；证据只增加数量不会自动变成另一分支的事实，矛盾片段只列示、不被采纳。
+- 重评结果（含采用/新增/矛盾片段与前后片段快照）保存在 `BranchSet.Reassessments` 中，随 `SaveBranchSet`/`LoadBranchSet` 在重开后完整保留依据。
 - 包数、会话数、已接收流字节和乱序缓存字节预算。
 
 运行测试：

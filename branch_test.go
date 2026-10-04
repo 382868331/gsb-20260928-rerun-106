@@ -143,10 +143,28 @@ func TestBranchReassessMarksMessagesForReinterpretation(t *testing.T) {
 	if len(reassessed.Messages) != 2 {
 		t.Fatalf("impacts = %#v, want MSG1 and MSG2", reassessed.Messages)
 	}
-	for _, impact := range reassessed.Messages {
-		if impact.Reinterpret {
-			t.Fatalf("impacts = %#v, want both exported messages still usable", reassessed.Messages)
+	var msg1Gap, msg2Gap *MessageImpact
+	for i := range reassessed.Messages {
+		switch {
+		case bytes.Equal(reassessed.Messages[i].Message.Data, []byte("MSG1")):
+			msg1Gap = &reassessed.Messages[i]
+		case bytes.Equal(reassessed.Messages[i].Message.Data, []byte("MSG2")):
+			msg2Gap = &reassessed.Messages[i]
 		}
+	}
+	// MSG1 is untouched by the late gap fill: content, boundary and the
+	// adopted fragment are identical, so the old conclusion stays citable.
+	if msg1Gap == nil || msg1Gap.Change != MessageUnchanged || msg1Gap.Usability != ConclusionCitable || msg1Gap.Reinterpret {
+		t.Fatalf("MSG1 impact = %#v, want unchanged/citable", msg1Gap)
+	}
+	if len(msg1Gap.AdoptedFragments) != 1 || msg1Gap.AdoptedFragments[0].Packet != 3 {
+		t.Fatalf("MSG1 adopted = %#v, want packet 3", msg1Gap.AdoptedFragments)
+	}
+	// The filled gap merges MSG2 into MIDMSG2: bytes at MSG2's offsets are
+	// the same, but its message boundary moved, so the exported standalone
+	// MSG2 conclusion must be reinterpreted.
+	if msg2Gap == nil || msg2Gap.Change != MessageBoundaryChange || msg2Gap.Usability != ConclusionMustReinterpret || !msg2Gap.Reinterpret {
+		t.Fatalf("MSG2 impact = %#v, want boundary_change/must_reinterpret", msg2Gap)
 	}
 
 	// Contradicting evidence invalidates the exported MSG1 conclusion.

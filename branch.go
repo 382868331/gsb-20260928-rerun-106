@@ -43,16 +43,21 @@ type BranchSet struct {
 	Direction Direction `json:"direction"`
 	Branches  []Branch  `json:"branches"`
 	Next      int       `json:"next"`
+	// Reassessments keeps the latest message-level reassessment per branch,
+	// including the adopted and newly added raw fragments, so the basis for
+	// every exported conclusion survives a save/reload cycle.
+	Reassessments map[string]BranchReassessment `json:"reassessments,omitempty"`
 }
 
 const BaseBranchID = "base"
 
 func NewBranchSet(sessionID string, direction Direction) *BranchSet {
 	return &BranchSet{
-		SessionID: sessionID,
-		Direction: direction,
-		Branches:  []Branch{{ID: BaseBranchID}},
-		Next:      1,
+		SessionID:     sessionID,
+		Direction:     direction,
+		Branches:      []Branch{{ID: BaseBranchID}},
+		Next:          1,
+		Reassessments: make(map[string]BranchReassessment),
 	}
 }
 
@@ -322,49 +327,196 @@ func sameFragments(a, b []Fragment) bool {
 	return true
 }
 
-// MessageImpact states whether a previously exported message-level
-// conclusion remains usable after new evidence arrived.
+// MessageChangeKind classifies what happened to one exported message after
+// new raw packets were ingested.
+type MessageChangeKind string
+
+const (
+	// MessageUnchanged: identical content, boundaries and supporting
+	// fragments; the old exported conclusion is still directly citable.
+	MessageUnchanged MessageChangeKind = "unchanged"
+	// MessageContentChange: at least one adopted byte differs, or bytes that
+	// backed the message became unresolved; the old conclusion must be
+	// reinterpreted.
+	MessageContentChange MessageChangeKind = "content_change"
+	// MessageBoundaryChange: adopted bytes are the same but message
+	// segmentation moved (split, merge or shift); the old conclusion must be
+	// reinterpreted against the new boundaries.
+	MessageBoundaryChange MessageChangeKind = "boundary_change"
+	// MessageConfidenceChange: content and boundaries are unchanged but the
+	// evidence set changed (additional corroboration, an ACK confirmation, or
+	// a contradicting sibling-branch fragment); the old conclusion stays
+	// citable but must carry an addendum noting the new basis.
+	MessageConfidenceChange MessageChangeKind = "confidence_change"
+)
+
+// ConclusionUsability states how a previously exported conclusion relates
+// to the reassessed evidence.
+type ConclusionUsability string
+
+const (
+	// ConclusionCitable: the old conclusion can be quoted unchanged.
+	ConclusionCitable ConclusionUsability = "citable"
+	// ConclusionNeedsAddendum: the conclusion text still holds, but the
+	// citation must note the changed confidence basis.
+	ConclusionNeedsAddendum ConclusionUsability = "needs_addendum"
+	// ConclusionMustReinterpret: content or boundaries moved; the old
+	// conclusion text can no longer stand on its own.
+	ConclusionMustReinterpret ConclusionUsability = "must_reinterpret"
+)
+
+// MessageImpact is the message-level result of a reassessment. It separates
+// content, boundary and confidence changes and records, per conclusion, both
+// the actually adopted raw fragments and the fragments newly added by the
+// last evidence batch. A mere increase of evidence count is never recorded
+// as another branch's fact: a contradicting fragment is listed as
+// contradicting evidence and never adopted.
 type MessageImpact struct {
-	Message     Message `json:"message"`
-	Reinterpret bool    `json:"reinterpret"`
-	Reason      string  `json:"reason,omitempty"`
+	Message   Message             `json:"message"`
+	Current   *Message            `json:"current,omitempty"`
+	Change    MessageChangeKind   `json:"change"`
+	Usability ConclusionUsability `json:"usability"`
+	// AdoptedFragments are the raw fragments that actually support the
+	// conclusion under this branch (before and after the reassessment).
+	AdoptedFragments []Fragment `json:"adopted_fragments,omitempty"`
+	// AddedSupportFragments are raw fragments newly observed that corroborate
+	// the adopted bytes (identical content, including retransmissions).
+	AddedSupportFragments []Fragment `json:"added_support_fragments,omitempty"`
+	// ContradictingFragments are newly observed fragments carrying different
+	// bytes for part of the message. They are evidence against the conclusion,
+	// never silently adopted, regardless of how many arrive.
+	ContradictingFragments []Fragment `json:"contradicting_fragments,omitempty"`
+	// ChangedRanges are the underlying byte ranges driving the impact.
+	ChangedRanges []ByteRange `json:"changed_ranges,omitempty"`
+	Reinterpret   bool        `json:"reinterpret"`
+	Reason        string      `json:"reason,omitempty"`
 }
 
 type BranchReassessment struct {
-	BranchID string          `json:"branch_id"`
-	Changes  Reassessment    `json:"changes"`
-	Messages []MessageImpact `json:"messages"`
+	BranchID     string          `json:"branch_id"`
+	StreamBefore StreamResultRef `json:"stream_before_ref"`
+	StreamAfter  StreamResultRef `json:"stream_after_ref"`
+	Changes      Reassessment    `json:"changes"`
+	Messages     []MessageImpact `json:"messages"`
+	NewMessages  []Message       `json:"new_messages,omitempty"`
 }
 
-// Reassess compares the stream before and after late bytes or contradicting
-// evidence, then maps the changed ranges onto the branch's previously
-// exported messages: messages touching resolved, invalidated or newly
-// uncertain ranges must be reinterpreted; messages only touched by
-// strengthened confidence stay usable.
+// StreamResultRef identifies the two evidence states a reassessment spans.
+type StreamResultRef struct {
+	Fragments []Fragment `json:"fragments,omitempty"`
+}
+
+// Reassess compares the stream before and after late raw packets (gap fills,
+// retransmissions, sibling-branch corroboration or contradicting overlaps)
+// and classifies each previously exported message as a content change, a
+// boundary change, a confidence-only change, or unchanged.
+//
+// Content and boundary changes invalidate the old exported conclusion text
+// (must_reinterpret). A confidence change keeps the conclusion citable but
+// requires an addendum (needs_addendum). Every impact lists the fragments it
+// actually adopts plus the newly added supporting fragments, split from new
+// contradicting fragments. The result is stored on the BranchSet, so after a
+// save/reload cycle the evidence basis is still available.
 func (s *BranchSet) Reassess(branchID string, before, after StreamResult) (BranchReassessment, error) {
-	interp, err := s.Interpret(before, branchID)
+	beforeInterp, err := s.Interpret(before, branchID)
+	if err != nil {
+		return BranchReassessment{}, err
+	}
+	afterInterp, err := s.Interpret(after, branchID)
 	if err != nil {
 		return BranchReassessment{}, err
 	}
 	changes := CompareStreamResults(before, after)
-	out := BranchReassessment{BranchID: branchID, Changes: changes}
-	var reinterpret []ByteRange
-	reinterpret = append(reinterpret, changeRanges(changes.Resolved)...)
-	reinterpret = append(reinterpret, changeRanges(changes.Invalidated)...)
-	reinterpret = append(reinterpret, changeRanges(changes.NewUncertain)...)
-	strengthened := changeRanges(changes.Strengthened)
-	for _, msg := range interp.Messages {
-		impact := MessageImpact{Message: msg}
-		if r, ok := firstIntersection(msg, reinterpret); ok {
+	newFragments := newObservedFragments(before.Fragments, after.Fragments)
+	out := BranchReassessment{
+		BranchID:     branchID,
+		StreamBefore: StreamResultRef{Fragments: append([]Fragment(nil), before.Fragments...)},
+		StreamAfter:  StreamResultRef{Fragments: append([]Fragment(nil), after.Fragments...)},
+		Changes:      changes,
+	}
+
+	contentRanges := append(append(append([]ByteRange{}, changeRanges(changes.Invalidated)...), changeRanges(changes.NewUncertain)...), changeRanges(changes.Resolved)...)
+	confidenceRanges := changeRanges(changes.Strengthened)
+
+	matchedAfter := make(map[int]bool)
+	for _, oldMsg := range beforeInterp.Messages {
+		impact := MessageImpact{
+			Message:          oldMsg,
+			AdoptedFragments: matchingFragments(oldMsg, before.Fragments, beforeInterp.Blocks),
+		}
+		supporting, contradicting := classifyNewFragments(oldMsg, newFragments, afterInterp.Blocks)
+		impact.AddedSupportFragments = supporting
+		impact.ContradictingFragments = contradicting
+
+		newMsg, matchIdx := matchMessage(oldMsg, afterInterp.Messages)
+		if newMsg != nil {
+			matchedAfter[matchIdx] = true
+			impact.Current = newMsg
+		}
+
+		overlapsContent := intersectsAny(oldMsg, contentRanges)
+		overlapsConfidence := intersectsAny(oldMsg, confidenceRanges) || len(supporting) > 0 || len(contradicting) > 0
+
+		switch {
+		case newMsg == nil:
+			// No message with the same start: the segmentation moved or the
+			// bytes became unresolved. Gap fills merge messages (boundary
+			// change); invalidation or fresh uncertainty changes content.
+			if len(contradicting) > 0 || intersectsAny(oldMsg, append(changeRanges(changes.Invalidated), changeRanges(changes.NewUncertain)...)) {
+				impact.Change = MessageContentChange
+				impact.Usability = ConclusionMustReinterpret
+				impact.Reinterpret = true
+				impact.ChangedRanges = append(impact.ChangedRanges, intersectingRanges(oldMsg, append(changeRanges(changes.Invalidated), changeRanges(changes.NewUncertain)...))...)
+				impact.Reason = "adopted bytes changed or became unresolved across the message; exported conclusion must be reinterpreted"
+			} else {
+				impact.Change = MessageBoundaryChange
+				impact.Usability = ConclusionMustReinterpret
+				impact.Reinterpret = true
+				impact.ChangedRanges = append(impact.ChangedRanges, intersectingRanges(oldMsg, contentRanges)...)
+				impact.Reason = "message boundaries moved after new bytes arrived; exported conclusion must be reinterpreted against new segmentation"
+			}
+		case !bytesEqual(newMsg.Data, oldMsg.Data):
+			impact.Change = MessageContentChange
+			impact.Usability = ConclusionMustReinterpret
 			impact.Reinterpret = true
-			impact.Reason = fmt.Sprintf("message overlaps changed range %d+%d; exported conclusion must be reinterpreted", r.Offset, r.Length)
-		} else if r, ok := firstIntersection(msg, strengthened); ok {
-			impact.Reason = fmt.Sprintf("confidence over range %d+%d strengthened; exported conclusion still usable", r.Offset, r.Length)
-		} else {
-			impact.Reason = "unaffected by new evidence; exported conclusion still usable"
+			impact.ChangedRanges = append(impact.ChangedRanges, intersectingRanges(oldMsg, contentRanges)...)
+			impact.Reason = "message content differs after reassessment; exported conclusion must be reinterpreted"
+		case newMsg.EndOffset != oldMsg.EndOffset:
+			impact.Change = MessageBoundaryChange
+			impact.Usability = ConclusionMustReinterpret
+			impact.Reinterpret = true
+			impact.ChangedRanges = append(impact.ChangedRanges, intersectingRanges(oldMsg, contentRanges)...)
+			impact.Reason = "message content is unchanged but boundaries moved; exported conclusion must be reinterpreted"
+		case overlapsContent:
+			// Same bytes and boundaries, yet an underlying range was
+			// resolved (e.g. the gap sat inside the message but another
+			// observation later covered it): still a confidence matter only
+			// when bytes agree; corroboration is cited, not reinterpreted.
+			impact.Change = MessageConfidenceChange
+			impact.Usability = ConclusionNeedsAddendum
+			impact.ChangedRanges = append(impact.ChangedRanges, intersectingRanges(oldMsg, contentRanges)...)
+			impact.Reason = "content and boundaries unchanged; newly resolved range corroborates the message, addendum required"
+		case overlapsConfidence:
+			impact.Change = MessageConfidenceChange
+			impact.Usability = ConclusionNeedsAddendum
+			impact.ChangedRanges = append(impact.ChangedRanges, intersectingRanges(oldMsg, confidenceRanges)...)
+			impact.Reason = "content and boundaries unchanged but the evidence set changed; conclusion stays citable with an addendum"
+		default:
+			impact.Change = MessageUnchanged
+			impact.Usability = ConclusionCitable
+			impact.Reason = "unaffected by new evidence; exported conclusion still citable"
 		}
 		out.Messages = append(out.Messages, impact)
 	}
+	for idx, msg := range afterInterp.Messages {
+		if !matchedAfter[idx] {
+			out.NewMessages = append(out.NewMessages, msg)
+		}
+	}
+	if s.Reassessments == nil {
+		s.Reassessments = make(map[string]BranchReassessment)
+	}
+	s.Reassessments[branchID] = out
 	return out, nil
 }
 
@@ -372,6 +524,123 @@ func changeRanges(changes []ConclusionChange) []ByteRange {
 	var out []ByteRange
 	for _, change := range changes {
 		out = append(out, change.Range)
+	}
+	return out
+}
+
+// newObservedFragments returns fragments present after reassessment but not
+// in the earlier evidence set. Packet indices restart at zero per pcap read,
+// so identity is the triple (packet index, stream offset, payload); an exact
+// duplicate is never counted twice.
+func newObservedFragments(before, after []Fragment) []Fragment {
+	type fragID struct {
+		packet int
+		offset int64
+		data   string
+	}
+	known := make(map[fragID]bool, len(before))
+	for _, frag := range before {
+		known[fragID{frag.Packet, frag.Offset, string(frag.Data)}] = true
+	}
+	var out []Fragment
+	for _, frag := range after {
+		key := fragID{frag.Packet, frag.Offset, string(frag.Data)}
+		if !known[key] {
+			out = append(out, frag)
+		}
+	}
+	return out
+}
+
+// matchMessage pairs an old message with the reassessed message sharing its
+// start offset (messages are delimiter-terminated from a fixed start). It
+// returns nil when segmentation moved away from that start.
+func matchMessage(old Message, current []Message) (*Message, int) {
+	for i := range current {
+		if current[i].StartOffset == old.StartOffset {
+			return &current[i], i
+		}
+	}
+	return nil, -1
+}
+
+// classifyNewFragments separates newly observed fragments overlapping a
+// message into supporting (identical to the bytes this branch adopts) and
+// contradicting (different bytes). A supporting fragment increases
+// confidence; a contradicting one is evidence for a sibling branch, never
+// adopted here no matter how many copies arrive.
+func classifyNewFragments(msg Message, newFragments []Fragment, blocks []Block) (supporting, contradicting []Fragment) {
+	for _, frag := range newFragments {
+		overlapStart := maxInt64(frag.Offset, msg.StartOffset)
+		overlapEnd := minInt64(frag.Offset+int64(len(frag.Data)), msg.EndOffset)
+		if overlapStart >= overlapEnd {
+			continue
+		}
+		if adoptedRangeMatches(frag, overlapStart, overlapEnd, blocks) {
+			supporting = append(supporting, frag)
+		} else {
+			contradicting = append(contradicting, frag)
+		}
+	}
+	return supporting, contradicting
+}
+
+// matchingFragments lists observed fragments whose overlapping bytes with
+// the message all equal the bytes this branch adopts. A fragment that
+// disagrees at a single byte is excluded even where most of it agrees, so a
+// sibling-branch observation is never listed as adopted evidence here.
+func matchingFragments(msg Message, fragments []Fragment, blocks []Block) []Fragment {
+	var out []Fragment
+	for _, frag := range fragments {
+		overlapStart := maxInt64(frag.Offset, msg.StartOffset)
+		overlapEnd := minInt64(frag.Offset+int64(len(frag.Data)), msg.EndOffset)
+		if overlapStart >= overlapEnd {
+			continue
+		}
+		if adoptedRangeMatches(frag, overlapStart, overlapEnd, blocks) {
+			out = append(out, frag)
+		}
+	}
+	return out
+}
+
+// adoptedRangeMatches reports whether a fragment's bytes over [start,end)
+// equal the bytes adopted by the branch's blocks. Gaps, conflicts and any
+// missing coverage count as non-matching, so a fragment cannot "support"
+// bytes the branch never adopted.
+func adoptedRangeMatches(frag Fragment, start, end int64, blocks []Block) bool {
+	for pos := start; pos < end; pos++ {
+		var adopted byte
+		covered := false
+		for _, block := range blocks {
+			if block.Kind != BlockData || pos < block.Offset || pos >= block.Offset+int64(block.Length) {
+				continue
+			}
+			adopted = block.Data[pos-block.Offset]
+			covered = true
+			break
+		}
+		if !covered {
+			return false
+		}
+		if adopted != frag.Data[pos-frag.Offset] {
+			return false
+		}
+	}
+	return true
+}
+
+func intersectsAny(msg Message, ranges []ByteRange) bool {
+	_, ok := firstIntersection(msg, ranges)
+	return ok
+}
+
+func intersectingRanges(msg Message, ranges []ByteRange) []ByteRange {
+	var out []ByteRange
+	for _, r := range ranges {
+		if msg.StartOffset < r.Offset+int64(r.Length) && r.Offset < msg.EndOffset {
+			out = append(out, r)
+		}
 	}
 	return out
 }
