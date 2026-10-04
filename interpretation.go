@@ -68,11 +68,6 @@ func messagesFromBlocks(blocks []Block, delim byte) []Message {
 		runStart = -1
 		sources = nil
 	}
-	addSource := func(source Fragment, position int64) {
-		if fragmentCovers(source, position) && !fragmentListed(sources, source) {
-			sources = append(sources, source)
-		}
-	}
 	for _, block := range blocks {
 		if block.Kind != BlockData {
 			discard()
@@ -92,15 +87,16 @@ func messagesFromBlocks(blocks []Block, delim byte) []Message {
 				discard()
 				continue
 			}
+			if runStart >= 0 && position != runStart+int64(len(run)) {
+				discard()
+			}
 			if runStart < 0 {
 				runStart = position
 			}
-			if position != runStart+int64(len(run)) {
-				discard()
-				runStart = position
-			}
 			for _, source := range block.Sources {
-				addSource(source, position)
+				if fragmentCovers(source, position) && !fragmentListed(sources, source) {
+					sources = append(sources, source)
+				}
 			}
 			run = append(run, value)
 		}
@@ -147,6 +143,12 @@ func CompareStreamResults(before, after StreamResult) Reassessment {
 	}
 	for _, r := range beforeConflicts {
 		if containsRange(afterConflicts, r) {
+			if afterBlock := blockAt(after.Blocks, r.Offset); afterBlock != nil {
+				if beforeBlock := blockAt(before.Blocks, r.Offset); beforeBlock != nil && corroboratesPrimary(beforeBlock, afterBlock) {
+					result.Strengthened = append(result.Strengthened, ConclusionChange{Direction: after.Direction, Range: r, Status: ConclusionStrengthened, Detail: "a new fragment corroborates one reading of the contested bytes; the conflict stays explicit until adopted"})
+					continue
+				}
+			}
 			result.StillUnresolved = append(result.StillUnresolved, ConclusionChange{Direction: after.Direction, Range: r, Status: ConclusionStillUnresolved, Detail: "conflicting observations remain"})
 			continue
 		}
@@ -171,6 +173,34 @@ func CompareStreamResults(before, after StreamResult) Reassessment {
 		}
 	}
 	return result
+}
+
+func blockAt(blocks []Block, offset int64) *Block {
+	for i := range blocks {
+		if blocks[i].Offset == offset {
+			return &blocks[i]
+		}
+	}
+	return nil
+}
+
+// corroboratesPrimary reports whether the after conflict block gained new
+// witnesses that agree with the first-observed (primary) reading, i.e. the
+// branch adopting that reading now has stronger evidence behind it.
+func corroboratesPrimary(before, after *Block) bool {
+	want := fragmentBytes(after.Sources[0], after.Offset, after.Length)
+	beforeAgree, afterAgree := 0, 0
+	for _, source := range before.Sources {
+		if bytesEqual(fragmentBytes(source, before.Offset, before.Length), want) {
+			beforeAgree++
+		}
+	}
+	for _, source := range after.Sources {
+		if bytesEqual(fragmentBytes(source, after.Offset, after.Length), want) {
+			afterAgree++
+		}
+	}
+	return afterAgree > beforeAgree
 }
 
 func rangeSet(gaps []Gap) map[ByteRange]bool {
