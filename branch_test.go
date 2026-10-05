@@ -226,11 +226,23 @@ func TestBranchReassessDistinguishesConfidenceAndBoundaryConflicts(t *testing.T)
 	if messageB.Status != MessageConclusionReinterpretRequired || !messageB.Reinterpret {
 		t.Fatalf("B impact = %#v, want reinterpretation for local conflict", messageB)
 	}
-	if len(messageB.AddedSupport) != 1 || !hasMessageChange(messageB.ChangeKinds, MessageChangeContent) {
-		t.Fatalf("B impact = %#v, want content conflict from added fragment", messageB)
+	if len(messageB.AddedSupport) != 0 || !hasMessageChange(messageB.ChangeKinds, MessageChangeContent) {
+		t.Fatalf("B impact = %#v, want content conflict, not added support", messageB)
 	}
-	if len(messageB.AddedSupport[0].Conflicts) != 1 || messageB.AddedSupport[0].Conflicts[0] != (ByteRange{Offset: 2, Length: 1}) {
-		t.Fatalf("B conflict ranges = %#v, want local B-only conflict", messageB.AddedSupport[0].Conflicts)
+	var newContested *MessageFragmentEvidence
+	for i := range messageB.StillConflicting {
+		if messageB.StillConflicting[i].New {
+			newContested = &messageB.StillConflicting[i]
+		}
+	}
+	if newContested == nil {
+		t.Fatalf("B still-conflicting = %#v, want the newly observed conflicting fragment", messageB.StillConflicting)
+	}
+	if len(newContested.Conflicts) != 1 || newContested.Conflicts[0] != (ByteRange{Offset: 2, Length: 1}) {
+		t.Fatalf("B conflict ranges = %#v, want local B-only conflict", newContested.Conflicts)
+	}
+	if len(newContested.Supports) != 1 || newContested.Supports[0] != (ByteRange{Offset: 3, Length: 1}) {
+		t.Fatalf("B support ranges = %#v, want local support for the shared newline", newContested.Supports)
 	}
 	if len(after.Blocks) != 3 {
 		t.Fatalf("after blocks = %#v, corroboration count must not select a branch fact", after.Blocks)
@@ -392,9 +404,190 @@ func TestBranchDemoBidirectionalAmbiguityAndReconvergence(t *testing.T) {
 		t.Fatalf("converged messages = %#v, want 200 OK and BODY", converged1.Messages)
 	}
 
-	// The c2s direction was never contested: identical on every branch.
-	c2s := a.Sessions()[0].Result(DirectionClientToServer)
-	if !bytes.Equal(c2s.Bytes, []byte("GET /a\n")) || len(c2s.UncertainRanges) != 0 {
-		t.Fatalf("c2s = %q uncertain=%#v, want fully confirmed", c2s.Bytes, c2s.UncertainRanges)
+}
+
+// Adding packets consistent with the chosen branch must not force a
+// redo: content and boundaries stay identical, so the exported messages
+// only need annotation. The pre-existing conflicting fragment keeps
+// being listed with its local ranges instead of demoting every later
+// change into reinterpretation, and the branch never re-judges the
+// adopted fact by evidence count. Demonstrated across a save/reopen
+// cycle with same-direction and reverse-direction appends.
+func TestBranchReassessAnnotatesConsistentEvidenceAcrossSaveReopen(t *testing.T) {
+	cISN := uint32(100)
+	sISN := uint32(200)
+	frames := append(handshakeFrames(cISN, sISN, 0),
+		goldenFrame(zeroTime(3), false, sISN+1, cISN+1, 0x18, []byte("200 OK\nBODY\n"), 10),
+		goldenFrame(zeroTime(4), false, sISN+1, cISN+1, 0x18, []byte("200 OKXBODY\n"), 11),
+	)
+	a := NewAssembler(DefaultLimits())
+	if err := ingestAll(a, mustReadFrames(t, frames)); err != nil {
+		t.Fatal(err)
+	}
+	sess := a.Sessions()[0]
+	before := sess.Result(DirectionServerToClient)
+	set := NewBranchSet(sess.ID, DirectionServerToClient)
+	optimist, err := set.Fork(BaseBranchID, BranchChoice{Range: ByteRange{Offset: 6, Length: 1}, Packet: 3, Rationale: "delimiter variant matches protocol grammar"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exported, err := set.Interpret(before, optimist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exported.Messages) != 2 {
+		t.Fatalf("exported messages = %#v, want 200 OK and BODY", exported.Messages)
+	}
+
+	// Save and reopen both the assembler and the branch set before the
+	// late evidence arrives.
+	asmData, err := a.SaveSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	branchData, err := SaveBranchSet(set)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredAsm, err := LoadAssemblerSnapshot(asmData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredSet, err := LoadBranchSet(branchData)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Append a same-direction corroboration, two more conflicting
+	// observations (outnumbering the adopted side), and a
+	// reverse-direction ACK.
+	late := []TCPFrameSpec{
+		goldenFrame(zeroTime(5), false, sISN+1, cISN+1, 0x18, []byte("200 OK\nBODY\n"), 12),
+		goldenFrame(zeroTime(6), false, sISN+1, cISN+1, 0x18, []byte("200 OKXBODY\n"), 13),
+		goldenFrame(zeroTime(7), false, sISN+1, cISN+1, 0x18, []byte("200 OKXBODY\n"), 14),
+		goldenFrame(zeroTime(8), true, cISN+1, sISN+13, 0x10, nil, 15),
+	}
+	if err := ingestAll(restoredAsm, mustReadFrames(t, late)); err != nil {
+		t.Fatal(err)
+	}
+	after := restoredAsm.Sessions()[0].Result(DirectionServerToClient)
+
+	corroPacket := -1
+	for _, frag := range after.Fragments {
+		if bytes.Equal(frag.Data, []byte("200 OK\nBODY\n")) && frag.Packet != 3 {
+			corroPacket = frag.Packet
+		}
+	}
+	if corroPacket < 0 {
+		t.Fatal("corroborating retransmission not found among fragments")
+	}
+
+	// The branch keeps its original choice: evidence count never
+	// re-judges the adopted fact.
+	branch, ok := restoredSet.Branch(optimist)
+	if !ok || len(branch.Choices) != 1 || branch.Choices[0].Packet != 3 {
+		t.Fatalf("branch after reopen = %#v, want the original choice kept", branch)
+	}
+	current, err := restoredSet.Interpret(after, optimist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Messages) != 2 || !bytes.Equal(current.Messages[0].Data, []byte("200 OK")) || !bytes.Equal(current.Messages[1].Data, []byte("BODY")) {
+		t.Fatalf("current messages = %#v, want adopted content unchanged despite majority conflicting evidence", current.Messages)
+	}
+
+	// Comparing against the old export yields confidence-only
+	// differences: same bytes, same boundaries, new backing fragments.
+	diffs := CompareInterpretations(exported, current)
+	if len(diffs) == 0 {
+		t.Fatal("want a confidence difference against the old export")
+	}
+	for _, diff := range diffs {
+		if diff.Kind != DifferenceConfidence {
+			t.Fatalf("diffs = %#v, want confidence_change only", diffs)
+		}
+	}
+
+	reassessment, err := restoredSet.Reassess(optimist, before, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reassessment.Changes.StillUnresolved) == 0 {
+		t.Fatalf("changes = %#v, want the contested range still unresolved", reassessment.Changes)
+	}
+	if len(reassessment.Messages) != 2 {
+		t.Fatalf("impacts = %#v, want both exported messages", reassessment.Messages)
+	}
+	for _, impact := range reassessment.Messages {
+		if impact.Status != MessageConclusionAnnotationRequired || impact.Reinterpret {
+			t.Fatalf("impact = %#v, want annotation only; consistent additions and pre-existing conflicts must not force reinterpretation", impact)
+		}
+		if hasMessageChange(impact.ChangeKinds, MessageChangeContent) || hasMessageChange(impact.ChangeKinds, MessageChangeBoundary) {
+			t.Fatalf("changes = %#v, want no content or boundary change", impact.ChangeKinds)
+		}
+		if !hasMessageChange(impact.ChangeKinds, MessageChangeConfidence) {
+			t.Fatalf("changes = %#v, want confidence_change recorded", impact.ChangeKinds)
+		}
+	}
+
+	// The first message lists adopted fragments, the newly added
+	// same-direction support, and the still-conflicting fragment with
+	// its local ranges across the newline.
+	first := reassessment.Messages[0]
+	if len(first.AdoptedSupport) == 0 {
+		t.Fatalf("adopted support = %#v, want adopted fragments listed", first.AdoptedSupport)
+	}
+	foundAdded := false
+	for _, evidence := range first.AddedSupport {
+		if evidence.Fragment.Packet == corroPacket && len(evidence.Conflicts) == 0 && len(evidence.Supports) > 0 {
+			foundAdded = true
+		}
+	}
+	if !foundAdded {
+		t.Fatalf("added support = %#v, want the corroborating retransmission", first.AddedSupport)
+	}
+	var contested *MessageFragmentEvidence
+	for i := range first.StillConflicting {
+		if first.StillConflicting[i].Fragment.Packet == 4 {
+			contested = &first.StillConflicting[i]
+		}
+	}
+	if contested == nil {
+		t.Fatalf("still conflicting = %#v, want the pre-existing conflicting fragment", first.StillConflicting)
+	}
+	if contested.New {
+		t.Fatalf("contested fragment = %#v, packet 4 existed before and must not count as new", contested)
+	}
+	if len(contested.Conflicts) != 1 || contested.Conflicts[0] != (ByteRange{Offset: 6, Length: 1}) {
+		t.Fatalf("contested conflicts = %#v, want the local newline byte only", contested.Conflicts)
+	}
+	if len(contested.Supports) != 1 || contested.Supports[0] != (ByteRange{Offset: 0, Length: 6}) {
+		t.Fatalf("contested supports = %#v, want local support for the shared prefix", contested.Supports)
+	}
+
+	// The same fragment locally supports the second message across the
+	// newline: listed as adopted support there, not as a conflict.
+	second := reassessment.Messages[1]
+	foundCrossNewline := false
+	for _, evidence := range second.AdoptedSupport {
+		if evidence.Fragment.Packet == 4 && len(evidence.Conflicts) == 0 && len(evidence.Supports) == 1 && evidence.Supports[0] == (ByteRange{Offset: 7, Length: 5}) {
+			foundCrossNewline = true
+		}
+	}
+	if !foundCrossNewline {
+		t.Fatalf("second adopted support = %#v, want packet 4 supporting BODY across the newline", second.AdoptedSupport)
+	}
+
+	// The reassessment itself survives a save/reopen cycle.
+	saved, err := SaveBranchReassessment(reassessment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := LoadBranchReassessment(saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.Messages) != 2 || len(reloaded.Messages[0].StillConflicting) == 0 || len(reloaded.Messages[0].AddedSupport) == 0 {
+		t.Fatalf("reloaded reassessment = %#v, want adopted/added/still-conflicting evidence retained", reloaded)
 	}
 }

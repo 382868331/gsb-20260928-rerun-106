@@ -325,15 +325,16 @@ func sameFragments(a, b []Fragment) bool {
 // MessageImpact states whether a previously exported message-level
 // conclusion remains usable after new evidence arrived.
 type MessageImpact struct {
-	Message         Message                   `json:"message"`
-	CurrentMessage  *Message                  `json:"current_message,omitempty"`
-	ChangeKinds     []MessageChangeKind       `json:"change_kinds,omitempty"`
-	Status          MessageConclusionStatus   `json:"status"`
-	Reinterpret     bool                      `json:"reinterpret"`
-	AdoptedSupport  []MessageFragmentEvidence `json:"adopted_support,omitempty"`
-	AddedSupport    []MessageFragmentEvidence `json:"added_support,omitempty"`
-	PreviousSources []Fragment                `json:"previous_sources,omitempty"`
-	Reason          string                    `json:"reason,omitempty"`
+	Message          Message                   `json:"message"`
+	CurrentMessage   *Message                  `json:"current_message,omitempty"`
+	ChangeKinds      []MessageChangeKind       `json:"change_kinds,omitempty"`
+	Status           MessageConclusionStatus   `json:"status"`
+	Reinterpret      bool                      `json:"reinterpret"`
+	AdoptedSupport   []MessageFragmentEvidence `json:"adopted_support,omitempty"`
+	AddedSupport     []MessageFragmentEvidence `json:"added_support,omitempty"`
+	StillConflicting []MessageFragmentEvidence `json:"still_conflicting,omitempty"`
+	PreviousSources  []Fragment                `json:"previous_sources,omitempty"`
+	Reason           string                    `json:"reason,omitempty"`
 }
 
 type BranchReassessment struct {
@@ -365,15 +366,18 @@ const (
 type MessageFragmentEvidence struct {
 	Fragment  Fragment    `json:"fragment"`
 	Adopted   bool        `json:"adopted,omitempty"`
+	New       bool        `json:"new,omitempty"`
 	Supports  []ByteRange `json:"supports,omitempty"`
 	Conflicts []ByteRange `json:"conflicts,omitempty"`
 }
 
 // Reassess compares the stream before and after late bytes or contradicting
 // evidence, then maps the changed ranges onto the branch's previously
-// exported messages: messages touching resolved, invalidated or newly
-// uncertain ranges must be reinterpreted; messages only touched by
-// strengthened confidence stay usable.
+// exported messages. Only real content or segmentation changes force
+// reinterpretation; newly added supporting evidence and still-contested
+// local ranges (including conflicts that already existed before) only
+// require annotation, so a pre-existing conflict never demotes every
+// later change into a redo.
 func (s *BranchSet) Reassess(branchID string, before, after StreamResult) (BranchReassessment, error) {
 	beforeInterp, err := s.Interpret(before, branchID)
 	if err != nil {
@@ -387,6 +391,7 @@ func (s *BranchSet) Reassess(branchID string, before, after StreamResult) (Branc
 	out := BranchReassessment{BranchID: branchID, Changes: changes}
 	beforeBytes := adoptedByteMap(beforeInterp)
 	afterBytes := adoptedByteMap(afterInterp)
+	beforePackets := fragmentPacketSet(before.Fragments)
 	for _, oldMsg := range beforeInterp.Messages {
 		current, hasCurrent := messageStartingAt(afterInterp.Messages, oldMsg.StartOffset)
 		impact := MessageImpact{
@@ -407,34 +412,32 @@ func (s *BranchSet) Reassess(branchID string, before, after StreamResult) (Branc
 			impact.ChangeKinds = appendMessageChange(impact.ChangeKinds, MessageChangeBoundary)
 		}
 
-		impact.AdoptedSupport, impact.AddedSupport = messageFragmentEvidence(oldMsg, current, hasCurrent, after, afterBytes)
+		impact.AdoptedSupport, impact.AddedSupport, impact.StillConflicting = messageFragmentEvidence(oldMsg, current, hasCurrent, after, afterBytes, beforePackets)
 		hasAddedSupport := len(impact.AddedSupport) > 0
-		hasConflict := false
-		for _, support := range impact.AddedSupport {
-			if len(support.Conflicts) > 0 {
-				hasConflict = true
+		hasNewConflict := false
+		for _, contested := range impact.StillConflicting {
+			if contested.New {
+				hasNewConflict = true
 			}
 		}
-		for _, support := range impact.AdoptedSupport {
-			if len(support.Conflicts) > 0 {
-				hasConflict = true
-			}
-		}
-		if hasAddedSupport {
+		if hasAddedSupport || hasNewConflict {
 			impact.ChangeKinds = appendMessageChange(impact.ChangeKinds, MessageChangeConfidence)
-		}
-		if crossesMessageBoundary(impact.AddedSupport, oldMsg) {
-			impact.ChangeKinds = appendMessageChange(impact.ChangeKinds, MessageChangeBoundary)
 		}
 
 		switch {
-		case len(contentRanges) > 0 || len(boundaryRanges) > 0 || hasConflict:
+		case len(contentRanges) > 0 || len(boundaryRanges) > 0:
 			impact.Status = MessageConclusionReinterpretRequired
 			impact.Reinterpret = true
-			impact.Reason = "content, segmentation, or contested evidence changed; exported conclusion must be reinterpreted"
+			impact.Reason = "adopted content or message segmentation changed; exported conclusion must be reinterpreted"
+		case hasAddedSupport && hasNewConflict:
+			impact.Status = MessageConclusionAnnotationRequired
+			impact.Reason = "adopted content and boundary are unchanged; annotate the added supporting fragments and the newly contested local ranges"
 		case hasAddedSupport:
 			impact.Status = MessageConclusionAnnotationRequired
 			impact.Reason = "message content and adopted boundary are unchanged; annotate the added supporting raw fragments"
+		case hasNewConflict:
+			impact.Status = MessageConclusionAnnotationRequired
+			impact.Reason = "adopted content is unchanged but new conflicting observations contest local ranges; annotate instead of reinterpreting"
 		}
 		out.Messages = append(out.Messages, impact)
 	}
@@ -476,16 +479,19 @@ func adoptedMessageChanges(old Message, current Message, hasCurrent bool, before
 	return mergeRanges(content), mergeRanges(boundary)
 }
 
-func messageFragmentEvidence(old Message, current Message, hasCurrent bool, after StreamResult, adopted map[int64]byte) ([]MessageFragmentEvidence, []MessageFragmentEvidence) {
-	previous := fragmentPacketSet(old.Sources)
+// messageFragmentEvidence splits the raw fragments overlapping one
+// exported message into three lists: fragments adopted by the branch,
+// newly observed fragments that only corroborate the adopted bytes, and
+// fragments (old or new) that still contest a local byte range. A
+// fragment crossing a newline can appear with both support and conflict
+// ranges; the adopted flag alone never hides that distinction.
+func messageFragmentEvidence(old Message, current Message, hasCurrent bool, after StreamResult, adopted map[int64]byte, beforePackets map[int]bool) (adoptedEvidence, addedEvidence, stillConflicting []MessageFragmentEvidence) {
 	adoptedPackets := make(map[int]bool)
 	if hasCurrent {
 		for _, frag := range current.Sources {
 			adoptedPackets[frag.Packet] = true
 		}
 	}
-	var adoptedEvidence []MessageFragmentEvidence
-	var addedEvidence []MessageFragmentEvidence
 	for _, frag := range after.Fragments {
 		fragmentEnd := frag.Offset + int64(len(frag.Data))
 		if fragmentEnd <= old.StartOffset || frag.Offset >= old.EndOffset {
@@ -509,17 +515,20 @@ func messageFragmentEvidence(old Message, current Message, hasCurrent bool, afte
 		evidence := MessageFragmentEvidence{
 			Fragment:  frag,
 			Adopted:   adoptedPackets[frag.Packet],
+			New:       !beforePackets[frag.Packet],
 			Supports:  supports,
 			Conflicts: conflicts,
 		}
 		if evidence.Adopted {
 			adoptedEvidence = append(adoptedEvidence, evidence)
 		}
-		if !previous[frag.Packet] {
+		if len(conflicts) > 0 {
+			stillConflicting = append(stillConflicting, evidence)
+		} else if evidence.New {
 			addedEvidence = append(addedEvidence, evidence)
 		}
 	}
-	return adoptedEvidence, addedEvidence
+	return adoptedEvidence, addedEvidence, stillConflicting
 }
 
 func accumulateEvidenceRange(off, end int64, supportsByte bool, supportStart, conflictStart int64, supports, conflicts *[]ByteRange) (int64, int64) {
@@ -549,22 +558,6 @@ func accumulateEvidenceRange(off, end int64, supportsByte bool, supportStart, co
 		conflictStart = -1
 	}
 	return supportStart, conflictStart
-}
-
-func crossesMessageBoundary(evidence []MessageFragmentEvidence, msg Message) bool {
-	for _, item := range evidence {
-		for _, r := range item.Conflicts {
-			if r.Offset < msg.EndOffset && r.Offset+int64(r.Length) > msg.StartOffset {
-				for off := r.Offset; off < r.Offset+int64(r.Length); off++ {
-					value := item.Fragment.Data[off-item.Fragment.Offset]
-					if value == '\n' || off == msg.EndOffset-1 {
-						return true
-					}
-				}
-			}
-		}
-	}
-	return false
 }
 
 func appendMessageChange(kinds []MessageChangeKind, kind MessageChangeKind) []MessageChangeKind {
